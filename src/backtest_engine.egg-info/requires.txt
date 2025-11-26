@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.26
+SQLAlchemy>=2.0
+psycopg2-binary
+PyYAML>=6.0
+python-dateutil
+tqdm
+
+[dev]
+pytest
+ipykernel

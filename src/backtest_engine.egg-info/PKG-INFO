@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: backtest-engine
+Version: 0.0.1
+Summary: Config-first backtest engine for Indian MF/PMS strategies
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=2.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: SQLAlchemy>=2.0
+Requires-Dist: psycopg2-binary
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: python-dateutil
+Requires-Dist: tqdm
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ipykernel; extra == "dev"
