@@ -3,11 +3,70 @@ from __future__ import annotations
 from datetime import date
 from typing import Iterable, List
 
+import os
 import pandas as pd
 
 from .data_provider import DataProvider
 from .config import UniverseConfig, SignalConfig
 from .db import run_sql
+
+_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _load_nifty500_tri() -> pd.DataFrame:
+    """Load Nifty 500 TRI levels from CSV and cache in memory.
+
+    Expected CSV format:
+        date,value
+
+    - `date` parseable as YYYY-MM-DD
+    - `value` numeric index level
+    """
+    global _BENCHMARK_CACHE
+    if "NIFTY_500_TRI" in _BENCHMARK_CACHE:
+        return _BENCHMARK_CACHE["NIFTY_500_TRI"]
+
+    # Allow overriding via env var; else use project-relative default
+_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _load_nifty500_tri() -> pd.DataFrame:
+    """Load Nifty 500 TRI levels from CSV and cache in memory.
+
+    Expected CSV location (by default):
+        src/backtest_engine/data/market/nifty500_tri.csv
+
+    Expected CSV format:
+        date,value
+    """
+    global _BENCHMARK_CACHE
+    if "NIFTY_500_TRI" in _BENCHMARK_CACHE:
+        return _BENCHMARK_CACHE["NIFTY_500_TRI"]
+
+    # 1) Allow override via env var if you ever want
+    csv_path = os.getenv("NIFTY500_TRI_CSV")
+    if not csv_path:
+        # 2) Default: src/backtest_engine/data/market/nifty500_tri.csv
+        here = os.path.dirname(__file__)  # .../src/backtest_engine
+        csv_path = os.path.join(here, "data", "market", "nifty500_tri.csv")
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Nifty 500 TRI CSV not found at {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df.sort_values("date").reset_index(drop=True)
+
+    _BENCHMARK_CACHE["NIFTY_500_TRI"] = df
+    return df
+
+    df = pd.read_csv(csv_path)
+    # Expect columns 'date' and 'value'
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df = df.sort_values("date").reset_index(drop=True)
+
+    _BENCHMARK_CACHE["NIFTY_500_TRI"] = df
+    return df
 
 
 class PostgresDataProvider(DataProvider):
@@ -88,36 +147,51 @@ class PostgresDataProvider(DataProvider):
         schemecodes: Iterable[int],
         signal_config: SignalConfig,
     ) -> pd.DataFrame:
-        """Return signal scores using the latest available ranking snapshot.
+        """Return signal scores as of `as_of` (no lookahead).
 
-        NOTE: This version *ignores* `as_of` and always uses the most recent
-        date in performance_ranking. This is a TEMPORARY hack to verify the
-        plumbing end-to-end and WILL introduce lookahead. We'll tighten this
-        once we inspect the actual date range in the table.
+        Logic:
+          - Use performance_ranking for Direct plans (plan_code = 5).
+          - For each schemecode, pick the latest row with `date <= as_of`.
+          - We don't filter by schemecodes here; we intersect with the
+            universe later via merge on schemecode.
         """
         col = self._resolve_signal_column(signal_config)
 
         query = f"""
-        WITH max_date AS (
-            SELECT MAX(date) AS max_date
-            FROM performance_ranking
-        ),
-        latest AS (
+        WITH latest AS (
             SELECT
                 pr.schemecode,
-                pr.{col} AS score
+                pr.{col} AS score,
+                pr.date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY pr.schemecode
+                    ORDER BY pr.date DESC
+                ) AS rn
             FROM performance_ranking pr
-            CROSS JOIN max_date md
-            WHERE pr.date = md.max_date
+            WHERE
+                pr.plan_code = 5
+                AND pr.date <= :as_of
         )
         SELECT
             schemecode,
             score
-        FROM latest;
+        FROM latest
+        WHERE rn = 1;
         """
 
-        df = run_sql(query)
+        params = {"as_of": as_of}
+
+        df = run_sql(query, params=params)
+
+        if df.empty:
+            raise RuntimeError(
+                f"No performance_ranking data found for as_of={as_of}. "
+                "Try using a later study_window.start, or check the available "
+                "date range in performance_ranking for plan_code=5."
+            )
+
         return df
+
 
     # ---------- NAV series ----------------------------------------------
 
@@ -159,7 +233,6 @@ class PostgresDataProvider(DataProvider):
         return df
 
     # ---------- Benchmark series ----------------------------------------
-
     def get_benchmark_series(
         self,
         start: date,
@@ -167,6 +240,19 @@ class PostgresDataProvider(DataProvider):
     ) -> pd.DataFrame:
         """Return benchmark (Nifty 500 TRI) index levels over [start, end].
 
-        We'll hook this up to your Nifty 500 TRI source later.
+        Uses a CSV file loaded via _load_nifty500_tri().
         """
-        raise NotImplementedError("get_benchmark_series not implemented yet.")
+        if start >= end:
+            raise ValueError(f"start ({start}) must be before end ({end})")
+
+        bench = _load_nifty500_tri()
+        mask = (bench["date"] >= start) & (bench["date"] <= end)
+        window = bench.loc[mask].copy()
+
+        if window.empty:
+            raise RuntimeError(
+                f"No Nifty 500 TRI data between {start} and {end}. "
+                "Check your CSV coverage."
+            )
+
+        return window
