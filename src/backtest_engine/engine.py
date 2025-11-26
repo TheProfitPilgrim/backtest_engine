@@ -87,7 +87,7 @@ class BacktestEngine:
             if universe_df.empty:
                 raise RuntimeError(f"No eligible universe on {rebalance_date}")
 
-            # 2) Get signal scores and pick Top N
+            # 2) Get signal scores and select funds
             scores_df = self.data_provider.get_signal_scores(
                 rebalance_date,
                 universe_df["schemecode"].tolist(),
@@ -99,17 +99,32 @@ class BacktestEngine:
                 .sort_values("score", ascending=(config.signal.direction == "asc"))
             )
 
-            top = merged.head(config.selection.top_n).copy()
+            sel_cfg = config.selection
+
+            # Selection mode: "top_n" vs "all"
+            if sel_cfg.mode == "top_n":
+                top = merged.head(sel_cfg.top_n).copy()
+            elif sel_cfg.mode == "all":
+                # Take all eligible funds (after universe + signal merge)
+                top = merged.copy()
+            else:
+                raise ValueError(f"Unknown selection.mode: {sel_cfg.mode!r}")
+
             n = len(top)
 
-            if n < config.selection.min_funds:
+            if n < sel_cfg.min_funds:
                 raise RuntimeError(
                     f"Only {n} eligible funds on {rebalance_date}, "
-                    f"min_funds={config.selection.min_funds}"
+                    f"min_funds={sel_cfg.min_funds}"
                 )
 
-            # 3) Equal-weight portfolio for this period
-            top["weight"] = 1.0 / n
+            # 3) Apply weight scheme (currently only equal-weight)
+            if sel_cfg.weight_scheme == "equal":
+                top["weight"] = 1.0 / n
+            else:
+                raise ValueError(
+                    f"Unknown weight_scheme: {sel_cfg.weight_scheme!r}"
+                )
 
             # 4) Pull NAV history for this period
             nav_df = self.data_provider.get_nav_series(

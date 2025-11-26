@@ -152,17 +152,14 @@ class PostgresDataProvider(DataProvider):
         Logic:
           - Use performance_ranking for Direct plans (plan_code = 5).
           - For each schemecode, pick the latest row with `date <= as_of`.
-          - We don't filter by schemecodes here; we intersect with the
-            universe later via merge on schemecode.
+          - Optionally apply filter_expression to remove some funds.
+          - Compute 'score' either from an expression or a single column.
         """
-        col = self._resolve_signal_column(signal_config)
-
-        query = f"""
+        # 1) Load *full* snapshot from performance_ranking (latest <= as_of, direct plan)
+        query = """
         WITH latest AS (
             SELECT
-                pr.schemecode,
-                pr.{col} AS score,
-                pr.date,
+                pr.*,
                 ROW_NUMBER() OVER (
                     PARTITION BY pr.schemecode
                     ORDER BY pr.date DESC
@@ -172,16 +169,11 @@ class PostgresDataProvider(DataProvider):
                 pr.plan_code = 5
                 AND pr.date <= :as_of
         )
-        SELECT
-            schemecode,
-            score
+        SELECT *
         FROM latest
         WHERE rn = 1;
         """
-
-        params = {"as_of": as_of}
-
-        df = run_sql(query, params=params)
+        df = run_sql(query, params={"as_of": as_of})
 
         if df.empty:
             raise RuntimeError(
@@ -190,8 +182,66 @@ class PostgresDataProvider(DataProvider):
                 "date range in performance_ranking for plan_code=5."
             )
 
-        return df
+        # 2) Optionally restrict to schemecodes passed in
+        if schemecodes:
+            codes_list = list(schemecodes)
+            df = df[df["schemecode"].isin(codes_list)]
 
+        if df.empty:
+            raise RuntimeError(
+                f"No performance_ranking rows found for given schemecodes as_of={as_of}."
+            )
+
+        # Drop the window helper column if present
+        if "rn" in df.columns:
+            df = df.drop(columns=["rn"])
+
+        # 3) Apply optional filter_expression (on the snapshot)
+        if signal_config.filter_expression:
+            expr = signal_config.filter_expression
+            env = {col: df[col] for col in df.columns}
+            try:
+                mask = pd.eval(expr, local_dict=env, engine="python")
+            except Exception as exc:
+                raise ValueError(
+                    f"Error evaluating filter_expression={expr!r} "
+                    f"on performance_ranking snapshot"
+                ) from exc
+
+            df = df[mask]
+
+            if df.empty:
+                raise RuntimeError(
+                    f"filter_expression removed all funds as_of={as_of}: {expr!r}"
+                )
+
+        # 4) Compute 'score' either from expression or from a resolved column
+        if signal_config.expression:
+            expr = signal_config.expression
+            env = {col: df[col] for col in df.columns}
+            try:
+                scores = pd.eval(expr, local_dict=env, engine="python")
+            except Exception as exc:
+                raise ValueError(
+                    f"Error evaluating signal expression={expr!r} "
+                    f"on performance_ranking snapshot"
+                ) from exc
+
+            df = df.copy()
+            df["score"] = scores
+        else:
+            # Fallback to simple column mode using existing mapping logic
+            col = self._resolve_signal_column(signal_config)
+            if col not in df.columns:
+                raise KeyError(
+                    f"Resolved signal column {col!r} not in performance_ranking "
+                    f"columns: {list(df.columns)}"
+                )
+            df = df.copy()
+            df["score"] = df[col]
+
+        # Final output: schemecode + score
+        return df[["schemecode", "score"]]
 
     # ---------- NAV series ----------------------------------------------
 
