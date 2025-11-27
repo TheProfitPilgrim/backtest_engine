@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import date
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Union
 
 import pandas as pd
 
@@ -10,9 +11,22 @@ from .config import BacktestConfig
 from .data_provider import DataProvider
 from .utils.dates import generate_rebalance_dates
 
-
 class BacktestResult:
-    """Container for engine outputs (we'll flesh this out)."""
+    """Container for engine outputs and helper methods.
+
+    Attributes
+    ----------
+    run_id : str
+        Identifier for this run (typically config.name).
+    summary : pd.DataFrame
+        One row per run, with total returns, CAGR, alpha, etc.
+    portfolio_periods : pd.DataFrame
+        One row per rebalance period with period-level returns.
+    holdings : pd.DataFrame
+        One row per fund per period with weights and period returns.
+    config : Optional[BacktestConfig]
+        Optional copy of the BacktestConfig used to run this backtest.
+    """
 
     def __init__(
         self,
@@ -20,12 +34,72 @@ class BacktestResult:
         summary: pd.DataFrame,
         portfolio_periods: pd.DataFrame,
         holdings: pd.DataFrame,
+        config: Optional[BacktestConfig] = None,
     ):
         self.run_id = run_id
         self.summary = summary
         self.portfolio_periods = portfolio_periods
         self.holdings = holdings
+        self.config = config
 
+    def save(
+        self,
+        out_dir: Union[str, Path],
+        level: Literal["light", "standard", "full"] = "standard",
+    ) -> Dict[str, Path]:
+        """Save result tables to CSV.
+
+        Parameters
+        ----------
+        out_dir : str or Path
+            Directory where CSVs will be written. It will be created if needed.
+        level : {"light", "standard", "full"}, default "standard"
+            - "light":    summary only
+            - "standard": summary + portfolio_periods
+            - "full":     summary + portfolio_periods + holdings (+ config if available)
+
+        Returns
+        -------
+        Dict[str, Path]
+            Mapping of logical name -> file path written.
+        """
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        prefix = self.run_id or "backtest"
+        paths: Dict[str, Path] = {}
+
+        # Always save summary
+        summary_path = out_dir / f"{prefix}.summary.csv"
+        self.summary.to_csv(summary_path, index=False)
+        paths["summary"] = summary_path
+
+        # Period-level table for standard/full
+        if level in ("standard", "full"):
+            periods_path = out_dir / f"{prefix}.periods.csv"
+            self.portfolio_periods.to_csv(periods_path, index=False)
+            paths["portfolio_periods"] = periods_path
+
+        # Holdings only for full (can be large)
+        if level == "full" and not self.holdings.empty:
+            holdings_path = out_dir / f"{prefix}.holdings.csv"
+            self.holdings.to_csv(holdings_path, index=False)
+            paths["holdings"] = holdings_path
+
+        # Optional: dump config as YAML for full runs, if available
+        if level == "full" and self.config is not None:
+            try:
+                import yaml  # PyYAML is already in requirements.txt
+
+                config_path = out_dir / f"{prefix}.config.yaml"
+                with config_path.open("w", encoding="utf-8") as f:
+                    yaml.safe_dump(asdict(self.config), f, sort_keys=False)
+                paths["config"] = config_path
+            except Exception:
+                # If PyYAML is missing or anything goes wrong, just skip config dump
+                pass
+
+        return paths
 
 class BacktestEngine:
     """Core engine orchestrator.
@@ -313,4 +387,5 @@ class BacktestEngine:
             summary=summary,
             portfolio_periods=portfolio_periods,
             holdings=holdings,
+            config=config,
         )
