@@ -12,6 +12,12 @@ from .db import run_sql
 
 _BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 
+from .formula import (
+    evaluate_formula_on_df,
+    load_selection_field_registry,
+    FormulaSyntaxError,
+    FormulaNameError,
+)
 
 def _load_nifty500_tri() -> pd.DataFrame:
     """Load Nifty 500 TRI levels from CSV and cache in memory.

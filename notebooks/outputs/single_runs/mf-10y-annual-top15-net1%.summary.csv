@@ -1,0 +1,2 @@
+run_id,name,start_date,end_date,num_periods,gross_return,gross_cagr,net_return,net_cagr,benchmark_return,benchmark_cagr,alpha_return,alpha_cagr,net_alpha_return,net_alpha_cagr,fees_applied,fees_annual_bps
+mf-10y-annual-top15-net1%,mf-10y-annual-top15-net1%,2014-01-01,2024-01-01,10,4.806077163749717,0.19219266822952363,4.250622951494439,0.18027074154722844,2.8722589741113236,0.14489125971806205,1.9338181896383935,0.047301408511461585,1.3783639773831151,0.03537948182916639,True,100.0
