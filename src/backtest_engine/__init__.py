@@ -1,13 +1,9 @@
-"""
-Backtest Engine
-
-Thin, config-first backtest engine for Indian MF/PMS strategies.
-
-This package is designed to be driven by YAML/JSON configs and to
-separate data access (DataProvider) from backtest logic (Engine).
-"""
-
-from .config import BacktestConfig
 from .engine import BacktestEngine
+from .postgres_provider import PostgresDataProvider
+from .batch import run_batch
 
-__all__ = ["BacktestConfig", "BacktestEngine"]
+__all__ = [
+    "BacktestEngine",
+    "PostgresDataProvider",
+    "run_batch",
+]
