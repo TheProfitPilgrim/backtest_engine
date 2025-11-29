@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 from .config import BacktestConfig
 from .data_provider import DataProvider
 from .utils.dates import generate_rebalance_dates
+
 
 class BacktestResult:
     """Container for engine outputs and helper methods.
@@ -19,11 +21,12 @@ class BacktestResult:
     run_id : str
         Identifier for this run (typically config.name).
     summary : pd.DataFrame
-        One row per run, with total returns, CAGR, alpha, etc.
+        For single mode: one row per run.
+        For rolling_cohort mode: one row per cohort.
     portfolio_periods : pd.DataFrame
-        One row per rebalance period with period-level returns.
+        One row per rebalance period (and per cohort, if rolling).
     holdings : pd.DataFrame
-        One row per fund per period with weights and period returns.
+        One row per fund per period (and per cohort, if rolling).
     config : Optional[BacktestConfig]
         Optional copy of the BacktestConfig used to run this backtest.
     """
@@ -101,24 +104,56 @@ class BacktestResult:
 
         return paths
 
+
 class BacktestEngine:
     """Core engine orchestrator.
 
-    Current capabilities:
-      - Single portfolio over a study window, with optional rebalancing.
-      - Universe via DataProvider.get_universe().
-      - Signals via DataProvider.get_signal_scores() (no lookahead).
-      - SelectionConfig: mode="top_n" or "all", equal-weight.
-      - NAV walking via DataProvider.get_nav_series().
-      - Benchmark (Nifty 500 TRI) via DataProvider.get_benchmark_series().
-      - Optional fee drag via BacktestConfig.fees (no tax yet).
+    Current capabilities
+    --------------------
+    - mode="single"
+        * Single portfolio over a study window, with optional rebalancing.
+        * Universe via DataProvider.get_universe().
+        * Signals via DataProvider.get_signal_scores() (no lookahead).
+        * SelectionConfig: mode="top_n" or "all", equal-weight.
+        * NAV walking via DataProvider.get_nav_series().
+        * Benchmark (Nifty 500 TRI) via DataProvider.get_benchmark_series().
+        * Optional fee drag via BacktestConfig.fees (no tax yet).
+
+        You can optionally provide `rebalance_signal` / `rebalance_selection`
+        to use different criteria from the 2nd period onwards.
+
+    - mode="rolling_cohort"
+        * Rolling cohorts inside study_window.
+        * Each cohort is just a single-mode run with its own [start, end].
+        * Cohorts are started every `cohorts.start_frequency` (e.g. "1M")
+          and each cohort has a holding horizon of `cohorts.horizon_years`.
+        * Summary/periods/holdings include `cohort_no`, `cohort_start`,
+          `cohort_end` columns so you can analyse distributions.
     """
 
     def __init__(self, data_provider: DataProvider):
         self.data_provider = data_provider
 
+    # ------------------------------------------------------------------
+    # Public entrypoint
+    # ------------------------------------------------------------------
+
     def run(self, config: BacktestConfig) -> BacktestResult:
-        """Run a backtest for a single portfolio, possibly with rebalancing."""
+        """Run a backtest in the requested mode."""
+        mode = getattr(config, "mode", "single")
+
+        if mode == "single":
+            return self._run_single(config)
+        elif mode == "rolling_cohort":
+            return self._run_rolling_cohorts(config)
+        else:
+            raise ValueError(f"Unsupported BacktestConfig.mode={mode!r}")
+
+    # ------------------------------------------------------------------
+    # Single backtest (current behaviour, extended slightly)
+    # ------------------------------------------------------------------
+
+    def _run_single(self, config: BacktestConfig) -> BacktestResult:
         run_id = config.name
 
         if config.study_window.start is None or config.study_window.end is None:
@@ -163,6 +198,14 @@ class BacktestEngine:
             )
             period_days = (period_end - period_start).days
 
+            # Decide which signal/selection to use
+            if period_no == 1:
+                signal_cfg = config.signal
+                selection_cfg = config.selection
+            else:
+                signal_cfg = config.rebalance_signal or config.signal
+                selection_cfg = config.rebalance_selection or config.selection
+
             # 1) Get investible universe on the rebalance date
             universe_df = self.data_provider.get_universe(
                 rebalance_date, config.universe
@@ -174,36 +217,38 @@ class BacktestEngine:
             scores_df = self.data_provider.get_signal_scores(
                 as_of=rebalance_date,
                 schemecodes=universe_df["schemecode"].tolist(),
-                signal_config=config.signal,
+                signal_config=signal_cfg,
             )
 
             merged = (
                 universe_df.merge(scores_df, on="schemecode", how="inner")
-                .sort_values("score", ascending=(config.signal.direction == "asc"))
+                # IMPORTANT: score is already "higher is better" from provider,
+                # so we always sort descending.
+                .sort_values("score", ascending=False)
             )
 
             # Selection modes
-            if config.selection.mode == "top_n":
-                top = merged.head(config.selection.top_n).copy()
-            elif config.selection.mode == "all":
+            if selection_cfg.mode == "top_n":
+                top = merged.head(selection_cfg.top_n).copy()
+            elif selection_cfg.mode == "all":
                 top = merged.copy()
             else:
                 raise ValueError(
-                    f"Unsupported selection.mode={config.selection.mode!r}"
+                    f"Unsupported selection.mode={selection_cfg.mode!r}"
                 )
 
             n = len(top)
 
-            if n < config.selection.min_funds:
+            if n < selection_cfg.min_funds:
                 raise RuntimeError(
                     f"Only {n} eligible funds on {rebalance_date}, "
-                    f"min_funds={config.selection.min_funds}"
+                    f"min_funds={selection_cfg.min_funds}"
                 )
 
             # 3) We currently only support equal-weight portfolios
-            if config.selection.weight_scheme != "equal":
+            if selection_cfg.weight_scheme != "equal":
                 raise ValueError(
-                    f"Unsupported weight_scheme={config.selection.weight_scheme!r}"
+                    f"Unsupported weight_scheme={selection_cfg.weight_scheme!r}"
                 )
             top["weight"] = 1.0 / n
 
@@ -384,6 +429,117 @@ class BacktestEngine:
 
         return BacktestResult(
             run_id=run_id,
+            summary=summary,
+            portfolio_periods=portfolio_periods,
+            holdings=holdings,
+            config=config,
+        )
+
+    # ------------------------------------------------------------------
+    # Rolling-cohort mode
+    # ------------------------------------------------------------------
+
+    def _run_rolling_cohorts(self, config: BacktestConfig) -> BacktestResult:
+        """Run rolling cohorts inside the study_window.
+
+        Each cohort:
+          - Starts at some date t0 within [window_start, window_end)
+          - Has end date t1 = min(t0 + horizon, window_end)
+          - Is run as an independent single-mode backtest (same rules)
+        """
+        if config.cohorts is None:
+            raise ValueError(
+                "BacktestConfig.mode='rolling_cohort' requires config.cohorts"
+            )
+
+        if config.study_window.start is None or config.study_window.end is None:
+            raise ValueError("study_window.start and end must be set")
+
+        window_start: date = config.study_window.start
+        window_end: date = config.study_window.end
+
+        # 1) Generate cohort start dates using the same calendar generator
+        cohort_starts = generate_rebalance_dates(
+            start=window_start,
+            end=window_end,
+            frequency=config.cohorts.start_frequency,
+        )
+
+        # 2) Convert horizon_years -> months and build relativedelta
+        horizon_months = int(round(config.cohorts.horizon_years * 12))
+        if horizon_months <= 0:
+            raise ValueError(
+                f"Invalid cohorts.horizon_years={config.cohorts.horizon_years}; "
+                "must be > 0."
+            )
+        horizon_delta = relativedelta(months=horizon_months)
+
+        all_summary: List[pd.DataFrame] = []
+        all_periods: List[pd.DataFrame] = []
+        all_holdings: List[pd.DataFrame] = []
+
+        cohort_no = 0
+
+        for t0 in cohort_starts:
+            t1 = t0 + horizon_delta
+            if t1 > window_end:
+                t1 = window_end
+            if t1 <= t0:
+                # horizon is too short; skip this cohort
+                continue
+
+            cohort_no += 1
+            sub_window = config.study_window.__class__(start=t0, end=t1)
+
+            # Build a sub-config that behaves like a single-mode run
+            sub_cfg = replace(
+                config,
+                study_window=sub_window,
+                mode="single",
+                cohorts=None,
+            )
+
+            sub_result = self._run_single(sub_cfg)
+
+            # Annotate with cohort metadata
+            s = sub_result.summary.copy()
+            s["cohort_no"] = cohort_no
+            s["cohort_start"] = t0
+            s["cohort_end"] = t1
+
+            p = sub_result.portfolio_periods.copy()
+            p["cohort_no"] = cohort_no
+            p["cohort_start"] = t0
+            p["cohort_end"] = t1
+
+            h = sub_result.holdings.copy()
+            if not h.empty:
+                h["cohort_no"] = cohort_no
+                h["cohort_start"] = t0
+                h["cohort_end"] = t1
+
+            all_summary.append(s)
+            all_periods.append(p)
+            if not h.empty:
+                all_holdings.append(h)
+
+        if not all_summary:
+            raise RuntimeError(
+                "No cohorts generated. Check study_window and cohorts settings."
+            )
+
+        summary = pd.concat(all_summary, ignore_index=True)
+        portfolio_periods = pd.concat(all_periods, ignore_index=True)
+        holdings = (
+            pd.concat(all_holdings, ignore_index=True)
+            if all_holdings
+            else pd.DataFrame()
+        )
+
+        # Note: run_id is still the *parent* run name; cohort-specific info
+        # lives in the extra columns.
+        return BacktestResult(
+            run_id=config.name,
             summary=summary,
             portfolio_periods=portfolio_periods,
             holdings=holdings,

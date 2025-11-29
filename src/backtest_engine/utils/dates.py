@@ -11,6 +11,7 @@ def _months_for_frequency(frequency: str) -> int:
     if frequency == "NONE":
         return 0
     mapping = {
+        "1M": 1,
         "3M": 3,
         "6M": 6,
         "12M": 12,

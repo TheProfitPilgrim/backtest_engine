@@ -66,13 +66,11 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-import os
-from typing import Optional
+from typing import Literal
 
 import pandas as pd
 import streamlit as st
 
-from backtest_engine import BacktestEngine, PostgresDataProvider, run_batch
 from backtest_engine.config import (
     BacktestConfig,
     StudyWindow,
@@ -81,367 +79,870 @@ from backtest_engine.config import (
     SelectionConfig,
     RebalanceConfig,
     FeeConfig,
+    TaxConfig,
+    CohortConfig,
 )
+from backtest_engine.engine import BacktestEngine
+from backtest_engine.postgres_provider import PostgresDataProvider
 
-# Root folder for saved runs (relative to repo root)
-BACKTEST_ROOT = Path("backtests")
 
-# Default DB env vars (for local development)
-DEFAULT_DB_ENV = {
-    "PGHOST": "localhost",
-    "PGPORT": "5433",
-    "PGDATABASE": "kairo_production",
-    "PGUSER": "sanjay_readonly",
-    "PGPASSWORD": "Piper112358!",
-}
+# -------------------------------------------------------------------
+# Paths & constants
+# -------------------------------------------------------------------
 
-# Set defaults only if not already set in the environment
-for key, value in DEFAULT_DB_ENV.items():
-    if not os.getenv(key):
-        os.environ[key] = value
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "notebooks" / "outputs" / "single_runs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def make_config(
-    name: str,
-    start: date,
-    end: date,
+
+# -------------------------------------------------------------------
+# Helper: descriptive text for what the backtest is answering
+# -------------------------------------------------------------------
+
+def describe_backtest(
+    mode: Literal["single", "rolling_cohort"],
+    start_date: date,
+    end_date: date,
     universe_preset: str,
-    signal_mode: str,
-    signal_name: str,
-    signal_direction: str,
-    expression: Optional[str],
-    filter_expression: Optional[str],
-    selection_mode: str,
-    top_n: int,
-    min_funds: int,
-    weight_scheme: str,
+    entry_signal_name: str,
+    entry_direction: str,
+    entry_mode: str,
+    entry_top_n: int | None,
     rebalance_freq: str,
-    apply_fee: bool,
-    fee_bps: float,
-) -> BacktestConfig:
-    """Build a BacktestConfig from UI inputs."""
-    # Build SignalConfig depending on mode
-    if signal_mode == "simple":
-        signal_cfg = SignalConfig(
-            name=signal_name,
-            direction=signal_direction,
+    has_separate_rebalance: bool,
+    rebalance_signal_name: str | None,
+    rebalance_direction: str | None,
+    rebalance_mode: str | None,
+    rebalance_top_n: int | None,
+    cohort_start_freq: str | None,
+    cohort_horizon_years: float | None,
+    fees_apply: bool,
+    fees_annual_bps: float,
+) -> str:
+    """Return an English description of the research question implied by the UI choices."""
+    dir_map = {
+        "asc": "lower values are better (ranks)",
+        "desc": "higher values are better (returns / scores)",
+    }
+    freq_map = {
+        "NONE": "no rebalancing (pure buy-and-hold)",
+        "1M": "monthly rebalancing",
+        "3M": "quarterly rebalancing",
+        "6M": "half-yearly rebalancing",
+        "12M": "annual rebalancing",
+        "18M": "18-month rebalancing",
+        "24M": "two-yearly rebalancing",
+    }
+    cohort_map = {
+        "1M": "every month",
+        "3M": "every 3 months",
+        "6M": "every 6 months",
+        "12M": "every year",
+    }
+
+    # Entry selection phrase
+    if entry_mode == "all":
+        selection_phrase = "all eligible funds from the universe"
+    else:
+        selection_phrase = f"the top {entry_top_n} funds from the universe"
+
+    base = (
+        f"If you invested a lumpsum into a portfolio of {selection_phrase} "
+        f"‘{universe_preset}’ on the chosen start dates, "
+        f"selected using the signal **{entry_signal_name}** "
+        f"where {dir_map.get(entry_direction, 'higher scores are better')}, "
+    )
+
+    # Rebalance description
+    rebalance_desc = ""
+    if rebalance_freq == "NONE":
+        rebalance_desc = "and then simply bought and held that portfolio without any rebalancing"
+    else:
+        # Same or separate criteria?
+        if not has_separate_rebalance:
+            rebalance_desc = (
+                f"and then rebalanced the portfolio using the **same criteria** "
+                f"{freq_map.get(rebalance_freq, 'on a fixed schedule')}"
+            )
+        else:
+            # separate rebalance criteria
+            if rebalance_mode == "all":
+                reb_sel_phrase = "all eligible funds at each rebalance"
+            else:
+                reb_sel_phrase = f"the top {rebalance_top_n} funds at each rebalance"
+
+            rebalance_desc = (
+                f"and then rebalanced the portfolio {freq_map.get(rebalance_freq, '')}, "
+                f"selecting {reb_sel_phrase} based on **{rebalance_signal_name}** "
+                f"where {dir_map.get(rebalance_direction or 'desc', 'higher scores are better')}"
+            )
+
+    # Mode-specific horizon description
+    if mode == "single":
+        horizon_desc = (
+            f"over the full backtest window from {start_date} to {end_date} "
+            f"(a single portfolio starting on {start_date})."
         )
     else:
-        signal_cfg = SignalConfig(
-            name="expression",
-            expression=expression or "",
-            filter_expression=filter_expression or "",
-            direction=signal_direction,
+        horizon_desc = (
+            f"starting a new cohort {cohort_map.get(cohort_start_freq or '1M', 'every month')} "
+            f"between {start_date} and {end_date}, "
+            f"and holding each cohort for approximately {cohort_horizon_years:.1f} years."
         )
 
-    selection_cfg = SelectionConfig(
-        mode=selection_mode,
-        top_n=top_n,
-        min_funds=min_funds,
-        weight_scheme=weight_scheme,
+    # Fee description
+    if fees_apply and fees_annual_bps > 0:
+        fee_desc = (
+            f" We also deduct an annual fee of {fees_annual_bps:.1f} bps "
+            f"(~{fees_annual_bps/100.0:.2f}% p.a.) from portfolio returns."
+        )
+    else:
+        fee_desc = " No additional fees are deducted in this backtest."
+
+    question = (
+        base
+        + rebalance_desc
+        + ", what would the portfolio have returned net of these rules compared to a "
+        "buy-and-hold Nifty 500 TRI benchmark? "
+        + horizon_desc
+        + fee_desc
     )
 
-    cfg = BacktestConfig(
-        name=name,
-        study_window=StudyWindow(start=start, end=end),
-        universe=UniverseConfig(preset=universe_preset),
-        signal=signal_cfg,
-        selection=selection_cfg,
-        rebalance=RebalanceConfig(frequency=rebalance_freq),
-        fees=FeeConfig(
-            apply=apply_fee,
-            annual_bps=fee_bps,
-        ),
+    return question
+
+
+# -------------------------------------------------------------------
+# Wizard helpers
+# -------------------------------------------------------------------
+
+def init_session_state():
+    if "wizard_step" not in st.session_state:
+        st.session_state.wizard_step = 1
+
+    # Basic fields defaults
+    st.session_state.setdefault("run_name", "mf-10y-annual-top15")
+    st.session_state.setdefault("mode", "single")
+    st.session_state.setdefault("study_start", date(2014, 1, 1))
+    st.session_state.setdefault("study_end", date(2024, 1, 1))
+
+    # Universe
+    st.session_state.setdefault("universe_preset", "equity_active_direct")
+
+    # Entry signal & selection
+    st.session_state.setdefault("entry_signal_name", "rank_12m_category")
+    st.session_state.setdefault("entry_signal_direction", "asc")  # ranks: lower is better
+    st.session_state.setdefault("entry_selection_mode", "top_n")
+    st.session_state.setdefault("entry_top_n", 15)
+    st.session_state.setdefault("entry_min_funds", 10)
+
+    # Rebalance
+    st.session_state.setdefault("rebalance_frequency", "12M")
+    st.session_state.setdefault("use_separate_rebalance", False)
+    st.session_state.setdefault("reb_signal_name", "rank_12m_category")
+    st.session_state.setdefault("reb_signal_direction", "asc")
+    st.session_state.setdefault("reb_selection_mode", "top_n")
+    st.session_state.setdefault("reb_top_n", 15)
+    st.session_state.setdefault("reb_min_funds", 10)
+
+    # Cohorts
+    st.session_state.setdefault("cohort_start_frequency", "1M")
+    st.session_state.setdefault("cohort_horizon_years", 3.0)
+
+    # Fees & tax
+    st.session_state.setdefault("fees_apply", False)
+    st.session_state.setdefault("fees_annual_bps", 100.0)
+    st.session_state.setdefault("tax_apply", False)
+    st.session_state.setdefault("tax_stcg_rate", 15.0)
+    st.session_state.setdefault("tax_ltcg_rate", 10.0)
+    st.session_state.setdefault("tax_ltcg_days", 365)
+
+
+def go_to_step(step: int):
+    st.session_state.wizard_step = step
+
+
+# -------------------------------------------------------------------
+# Build BacktestConfig from session_state
+# -------------------------------------------------------------------
+
+def build_config_from_state() -> BacktestConfig:
+    mode = st.session_state.mode
+    start_date = st.session_state.study_start
+    end_date = st.session_state.study_end
+
+    # Core configs
+    study_window = StudyWindow(start=start_date, end=end_date)
+    universe = UniverseConfig(preset=st.session_state.universe_preset)
+
+    entry_signal = SignalConfig(
+        name=st.session_state.entry_signal_name,
+        direction=st.session_state.entry_signal_direction,
     )
+
+    entry_selection = SelectionConfig(
+        mode=st.session_state.entry_selection_mode,
+        top_n=st.session_state.entry_top_n,
+        min_funds=st.session_state.entry_min_funds,
+        weight_scheme="equal",
+    )
+
+    rebalance = RebalanceConfig(
+        frequency=st.session_state.rebalance_frequency
+    )
+
+    # Fees & tax
+    fees = FeeConfig(
+        apply=st.session_state.fees_apply,
+        annual_bps=st.session_state.fees_annual_bps if st.session_state.fees_apply else 0.0,
+    )
+    tax = TaxConfig(
+        apply=st.session_state.tax_apply,
+        stcg_rate=st.session_state.tax_stcg_rate / 100.0,
+        ltcg_rate=st.session_state.tax_ltcg_rate / 100.0,
+        ltcg_holding_days=st.session_state.tax_ltcg_days,
+    )
+
+    # Optional separate rebalance criteria
+    if st.session_state.use_separate_rebalance:
+        reb_signal = SignalConfig(
+            name=st.session_state.reb_signal_name,
+            direction=st.session_state.reb_signal_direction,
+        )
+        reb_selection = SelectionConfig(
+            mode=st.session_state.reb_selection_mode,
+            top_n=st.session_state.reb_top_n,
+            min_funds=st.session_state.reb_min_funds,
+            weight_scheme="equal",
+        )
+    else:
+        reb_signal = None
+        reb_selection = None
+
+    # Mode-specific: cohorts
+    if mode == "rolling_cohort":
+        cohorts = CohortConfig(
+            start_frequency=st.session_state.cohort_start_frequency,
+            horizon_years=st.session_state.cohort_horizon_years,
+        )
+    else:
+        cohorts = None
+
+    cfg = BacktestConfig(
+        name=st.session_state.run_name,
+        study_window=study_window,
+        universe=universe,
+        signal=entry_signal,
+        selection=entry_selection,
+        rebalance=rebalance,
+        mode=mode,
+        cohorts=cohorts,
+        fees=fees,
+        tax=tax,
+        rebalance_signal=reb_signal,
+        rebalance_selection=reb_selection,
+        metadata={},  # free-form, for future Notion linking, etc.
+    )
+
     return cfg
 
 
-def save_to_index(result_summary: pd.DataFrame, run_dir: Path, save_level: str) -> None:
-    """Append this run to backtests/index.csv for easy browsing later."""
-    BACKTEST_ROOT.mkdir(parents=True, exist_ok=True)
-    index_path = BACKTEST_ROOT / "index.csv"
+# -------------------------------------------------------------------
+# Streamlit app
+# -------------------------------------------------------------------
 
-    summary = result_summary.copy()
-    summary["output_dir"] = str(run_dir)
-    summary["save_level"] = save_level
-
-    if index_path.exists():
-        existing = pd.read_csv(index_path)
-        combined = pd.concat([existing, summary], ignore_index=True)
-    else:
-        combined = summary
-
-    combined.to_csv(index_path, index=False)
-
-
-def main() -> None:
+def main():
     st.set_page_config(
-        page_title="MF Backtest Engine",
+        page_title="Backtest Engine Wizard",
         layout="wide",
     )
 
-    st.title("📈 Mutual Fund Backtest Engine")
+    init_session_state()
 
+    st.title("📈 Mutual Fund Backtest Wizard")
     st.markdown(
-        "This UI wraps the `backtest_engine` package.\n\n"
-        "Make sure your SSH tunnel to the Kairo DB is running and PG* env vars are set "
-        "before running backtests."
+        """
+This wizard walks you step-by-step through setting up a **no-lookahead mutual fund backtest**.
+
+At each step, you choose *what question you want the backtest to answer*.
+We'll then form portfolios from your Postgres database and compare them to a **buy-and-hold Nifty 500 TRI** benchmark.
+"""
     )
 
-    tabs = st.tabs(["Run backtest", "Saved backtests"])
+    step = st.session_state.wizard_step
 
-    # -------------------------------------------------------------------------
-    # TAB 1: RUN BACKTEST
-    # -------------------------------------------------------------------------
-    with tabs[0]:
-        st.header("Run a new backtest")
+    st.sidebar.markdown("### Wizard steps")
+    st.sidebar.write(
+        f"Current step: **{step} / 6**"
+    )
+    st.sidebar.button("⏮ Start over", on_click=lambda: go_to_step(1))
 
-        col_run_left, col_run_right = st.columns(2)
+    # --------------------------------------------------------------
+    # STEP 1 – Backtest type & time window
+    # --------------------------------------------------------------
+    if step == 1:
+        st.header("Step 1 – Backtest type & time window")
 
-        with col_run_left:
-            st.subheader("Universe & dates")
+        st.markdown(
+            """
+Here you decide **how many portfolios** we simulate and **over what calendar window**.
 
-            run_name = st.text_input(
-                "Run name",
-                value="mf-10y-annual-top15-net1%",
-                help="Used for folder names and file prefixes.",
+- **Single backtest** → one portfolio starting at the study start date.
+- **Rolling cohorts** → a new portfolio starts every X months; each is held for a fixed horizon.
+"""
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            mode_label = st.radio(
+                "Backtest mode",
+                options=["single", "rolling_cohort"],
+                format_func=lambda x: "Single backtest" if x == "single" else "Rolling cohorts",
+                key="mode",
             )
 
-            universe_preset = st.selectbox(
-                "Universe preset",
-                options=["equity_active_direct"],
-                index=0,
-                help="More presets can be added later.",
+            st.session_state.mode = mode_label
+
+        with col2:
+            st.session_state.study_start, st.session_state.study_end = st.date_input(
+                "Study window (start and end dates)",
+                value=(st.session_state.study_start, st.session_state.study_end),
+                help="This is the overall calendar window the backtest is allowed to use.",
             )
 
-            start_date = st.date_input(
-                "Start date",
-                value=date(2014, 1, 1),
-            )
-            end_date = st.date_input(
-                "End date",
-                value=date(2024, 1, 1),
-            )
-
-            if start_date >= end_date:
-                st.error("Start date must be before end date.")
-
-            st.subheader("Rebalancing")
-
-            rebalance_freq = st.selectbox(
-                "Rebalance frequency",
-                options=["NONE", "3M", "6M", "12M", "18M", "24M"],
-                index=3,  # default 12M
-            )
-
-            st.subheader("Fees")
-
-            apply_fee = st.checkbox(
-                "Apply annual fee?",
-                value=True,
-            )
-            fee_bps = st.slider(
-                "Fee (bps per year)",
-                min_value=0,
-                max_value=300,
-                value=100,
-                step=10,
-            )
-
-            save_level = st.selectbox(
-                "Output detail level",
-                options=["light", "standard", "full"],
-                index=1,
-                help="Full includes holdings & config; can be large.",
-            )
-
-        with col_run_right:
-            st.subheader("Signal (selection criteria)")
-
-            signal_mode = st.radio(
-                "Signal mode",
-                options=[
-                    "simple",
-                    "expression",
-                ],
-                format_func=lambda x: "Simple column" if x == "simple" else "Expression (formula-based)",
-            )
-
-            if signal_mode == "simple":
-                signal_name = st.text_input(
-                    "Signal column name",
-                    value="rank_12m_category",
-                    help="Must correspond to a column in performance_ranking.",
+        if st.session_state.mode == "rolling_cohort":
+            st.markdown("#### Cohort settings")
+            col3, col4 = st.columns(2)
+            with col3:
+                st.selectbox(
+                    "How often should a new cohort start?",
+                    options=["1M", "3M", "6M", "12M"],
+                    format_func=lambda x: {
+                        "1M": "Every month",
+                        "3M": "Every 3 months",
+                        "6M": "Every 6 months",
+                        "12M": "Every year",
+                    }[x],
+                    key="cohort_start_frequency",
                 )
-                expression = None
-                filter_expression = None
-            else:
-                signal_name = "expression"
-                expression = st.text_area(
-                    "Score expression",
-                    value="perf_1y * 0.5 + perf_3y * 0.5",
-                    height=80,
-                    help="Use columns from performance_ranking (e.g. perf_1y, perf_3y, aum_cr, etc.).",
-                )
-                filter_expression = st.text_area(
-                    "Filter expression (optional)",
-                    value="aum_cr > 300 and age_years >= 3",
-                    height=60,
-                    help="Only funds where this is True will be eligible.",
+            with col4:
+                st.slider(
+                    "Holding horizon for each cohort (years)",
+                    min_value=1.0,
+                    max_value=15.0,
+                    step=0.5,
+                    key="cohort_horizon_years",
+                    help="Each cohort portfolio will be held for this long (or until the study window ends).",
                 )
 
-            signal_direction_label = st.radio(
-                "Signal direction",
+        st.markdown("---")
+        col_prev, col_next = st.columns([1, 1])
+        with col_prev:
+            st.button("⬅ Previous", disabled=True)
+        with col_next:
+            st.button("Next ➡", on_click=lambda: go_to_step(2))
+
+    # --------------------------------------------------------------
+    # STEP 2 – Universe
+    # --------------------------------------------------------------
+    elif step == 2:
+        st.header("Step 2 – Universe")
+
+        st.markdown(
+            """
+The **universe** defines **which mutual funds are even eligible** for selection.
+
+For now, we use a small set of **presets** that map to SQL filters inside the engine.  
+(For example, `equity_active_direct` = active equity schemes, direct plans, investible today, excluding thematic/sector, etc.)
+"""
+        )
+
+        st.selectbox(
+            "Universe preset",
+            options=[
+                "equity_active_direct",
+            ],
+            key="universe_preset",
+            help="More presets can be added over time. For now this uses the core equity active direct universe.",
+        )
+
+        st.info(
+            "Under the hood, the engine will query your Postgres DB for all schemes in this universe on each rebalance date."
+        )
+
+        st.markdown("---")
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            st.button("⬅ Previous", on_click=lambda: go_to_step(1))
+        with col_next:
+            st.button("Next ➡", on_click=lambda: go_to_step(3))
+
+    # --------------------------------------------------------------
+    # STEP 3 – Entry signal & selection
+    # --------------------------------------------------------------
+    elif step == 3:
+        st.header("Step 3 – Entry signal & selection")
+
+        st.markdown(
+            """
+Here you tell the engine **how to score and pick funds at the start of the portfolio.**
+
+Think of it as:  
+> *“On each start date, which funds should I buy?”*
+"""
+        )
+
+        st.subheader("Signal (scoring rule) for initial selection")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input(
+                "Signal name",
+                key="entry_signal_name",
+                help="Example: rank_12m_category, rank_3y_universe, perf_1y, etc. The engine maps this to a column in performance_ranking.",
+            )
+        with col2:
+            st.radio(
+                "How should scores be interpreted?",
                 options=["asc", "desc"],
-                format_func=lambda x: "Ascending (lower score is better)" if x == "asc" else "Descending (higher is better)",
-                index=0,
-            )
-            signal_direction = signal_direction_label  # already 'asc' or 'desc'
-
-            st.subheader("Selection")
-
-            selection_mode = st.radio(
-                "Selection mode",
-                options=["top_n", "all"],
-                format_func=lambda x: "Top N" if x == "top_n" else "All eligible",
+                format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc" else "Higher is better (returns / scores)",
+                key="entry_signal_direction",
             )
 
-            if selection_mode == "top_n":
-                top_n = st.slider(
-                    "Top N funds",
-                    min_value=1,
+        st.subheader("Selection rule at portfolio inception")
+
+        st.radio(
+            "Selection mode",
+            options=["top_n", "all"],
+            format_func=lambda x: "Top N funds" if x == "top_n" else "All eligible funds",
+            key="entry_selection_mode",
+        )
+
+        if st.session_state.entry_selection_mode == "top_n":
+            col3, col4 = st.columns(2)
+            with col3:
+                st.slider(
+                    "Top N funds to pick",
+                    min_value=5,
                     max_value=100,
-                    value=15,
                     step=1,
+                    key="entry_top_n",
                 )
-            else:
-                top_n = 999999  # effectively "all", but SelectionConfig will only use it for top_n mode
-
-            min_funds = st.slider(
-                "Minimum number of funds required",
+            with col4:
+                st.slider(
+                    "Minimum eligible funds required",
+                    min_value=1,
+                    max_value=50,
+                    step=1,
+                    key="entry_min_funds",
+                    help="If fewer than this many funds are eligible, the backtest will fail for that date.",
+                )
+        else:
+            st.slider(
+                "Minimum eligible funds required",
                 min_value=1,
                 max_value=50,
-                value=10,
                 step=1,
-                help="If fewer eligible funds are found, the run will error out.",
+                key="entry_min_funds",
+                help="If fewer than this many funds are eligible, the backtest will fail for that date.",
             )
 
-            weight_scheme = "equal"  # only equal-weight implemented for now
-            st.markdown("Weighting scheme: **equal-weight** (1/N) for now.")
+        st.info("Weights are currently always equal-weight across the selected funds.")
 
-        run_button = st.button("🚀 Run backtest", type="primary")
+        st.markdown("---")
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            st.button("⬅ Previous", on_click=lambda: go_to_step(2))
+        with col_next:
+            st.button("Next ➡", on_click=lambda: go_to_step(4))
 
-        if run_button:
-            with st.spinner("Running backtest..."):
-                try:
-                    provider = PostgresDataProvider()
+    # --------------------------------------------------------------
+    # STEP 4 – Rebalancing & (optional) separate criteria
+    # --------------------------------------------------------------
+    elif step == 4:
+        st.header("Step 4 – Rebalancing behaviour")
 
-                    cfg = make_config(
-                        name=run_name,
-                        start=start_date,
-                        end=end_date,
-                        universe_preset=universe_preset,
-                        signal_mode=signal_mode,
-                        signal_name=signal_name,
-                        signal_direction=signal_direction,
-                        expression=expression,
-                        filter_expression=filter_expression,
-                        selection_mode=selection_mode,
-                        top_n=top_n,
-                        min_funds=min_funds,
-                        weight_scheme=weight_scheme,
-                        rebalance_freq=rebalance_freq,
-                        apply_fee=apply_fee,
-                        fee_bps=float(fee_bps),
+        st.markdown(
+            """
+Now decide **if and how the portfolio should be rebalanced over time.**
+
+- **No rebalancing** → buy at inception and hold until the end (pure momentum / selection effect).
+- **Time-based rebalancing** → periodically re-run your logic and adjust the portfolio.
+"""
+        )
+
+        st.selectbox(
+            "Rebalancing frequency",
+            options=["NONE", "1M", "3M", "6M", "12M", "18M", "24M"],
+            format_func=lambda x: {
+                "NONE": "No rebalancing (buy & hold)",
+                "1M": "Every month",
+                "3M": "Every 3 months",
+                "6M": "Every 6 months",
+                "12M": "Every 12 months (annual)",
+                "18M": "Every 18 months",
+                "24M": "Every 24 months",
+            }[x],
+            key="rebalance_frequency",
+        )
+
+        if st.session_state.rebalance_frequency != "NONE":
+            st.checkbox(
+                "Use different criteria at rebalancing than at initial selection?",
+                key="use_separate_rebalance",
+            )
+
+            if st.session_state.use_separate_rebalance:
+                st.subheader("Rebalance signal & selection (used from 2nd period onwards)")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.text_input(
+                        "Rebalance signal name",
+                        key="reb_signal_name",
+                        help="Example: rank_12m_category, perf_3y, blended rank, etc.",
+                    )
+                with col2:
+                    st.radio(
+                        "How should rebalance scores be interpreted?",
+                        options=["asc", "desc"],
+                        format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc" else "Higher is better (returns / scores)",
+                        key="reb_signal_direction",
                     )
 
-                    engine = BacktestEngine(provider)
-                    result = engine.run(cfg)
+                st.radio(
+                    "Rebalance selection mode",
+                    options=["top_n", "all"],
+                    format_func=lambda x: "Top N funds" if x == "top_n" else "All eligible funds",
+                    key="reb_selection_mode",
+                )
 
-                    # Save outputs under backtests/<run_name>/
-                    run_dir = BACKTEST_ROOT / run_name
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    paths = result.save(run_dir, level=save_level)
-
-                    # Update index
-                    save_to_index(result.summary, run_dir, save_level)
-
-                    st.success("Backtest completed ✅")
-                    st.subheader("Summary")
-                    st.dataframe(result.summary)
-
-                    st.subheader("Period-level results (first 20 rows)")
-                    if "period_no" in result.portfolio_periods.columns:
-                        st.dataframe(
-                            result.portfolio_periods.head(20)
+                if st.session_state.reb_selection_mode == "top_n":
+                    col3, col4 = st.columns(2)
+                    with col3:
+                        st.slider(
+                            "Top N funds to pick at rebalance",
+                            min_value=5,
+                            max_value=100,
+                            step=1,
+                            key="reb_top_n",
                         )
-                    else:
-                        st.write("No period-level data available.")
-
-                    st.subheader("Saved files")
-                    for key, path in paths.items():
-                        st.write(f"- **{key}** → `{path}`")
-
-                except Exception as e:
-                    st.error(f"Backtest failed: {e!r}")
-
-    # -------------------------------------------------------------------------
-    # TAB 2: SAVED BACKTESTS
-    # -------------------------------------------------------------------------
-    with tabs[1]:
-        st.header("Saved backtests")
-
-        index_path = BACKTEST_ROOT / "index.csv"
-        if not index_path.exists():
-            st.info("No saved backtests yet. Run a backtest in the first tab.")
-            return
-
-        index_df = pd.read_csv(index_path)
-
-        if index_df.empty:
-            st.info("Index is empty. Run a backtest in the first tab.")
-            return
-
-        st.subheader("Backtest index")
-        st.dataframe(index_df)
-
-        run_names = index_df["run_id"].unique().tolist() if "run_id" in index_df.columns else []
-
-        if run_names:
-            selected_run = st.selectbox(
-                "Select a run to inspect",
-                options=run_names,
-            )
-            if selected_run:
-                # Find row for this run
-                row = index_df[index_df["run_id"] == selected_run].iloc[0]
-                run_dir = Path(row["output_dir"])
-
-                st.markdown(f"### Details for **{selected_run}**")
-                st.write(f"Output directory: `{run_dir}`")
-
-                # Try loading summary / periods / holdings
-                summary_path = run_dir / f"{selected_run}.summary.csv"
-                periods_path = run_dir / f"{selected_run}.periods.csv"
-                holdings_path = run_dir / f"{selected_run}.holdings.csv"
-
-                if summary_path.exists():
-                    st.subheader("Summary")
-                    st.dataframe(pd.read_csv(summary_path))
-
-                if periods_path.exists():
-                    st.subheader("Period-level results")
-                    st.dataframe(pd.read_csv(periods_path).head(50))
-
-                if holdings_path.exists():
-                    with st.expander("Holdings (first 100 rows)"):
-                        st.dataframe(pd.read_csv(holdings_path).head(100))
+                    with col4:
+                        st.slider(
+                            "Minimum eligible funds required at rebalance",
+                            min_value=1,
+                            max_value=50,
+                            step=1,
+                            key="reb_min_funds",
+                        )
+                else:
+                    st.slider(
+                        "Minimum eligible funds required at rebalance",
+                        min_value=1,
+                        max_value=50,
+                        step=1,
+                        key="reb_min_funds",
+                    )
+            else:
+                st.info(
+                    "From the second period onwards, the engine will reuse the **same signal and selection** as at inception."
+                )
         else:
-            st.info("No run_id column found in index.csv; cannot select runs.")
+            st.info(
+                "No rebalancing: we form the portfolio once at the start of its life and then leave it untouched."
+            )
+
+        st.markdown("---")
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            st.button("⬅ Previous", on_click=lambda: go_to_step(3))
+        with col_next:
+            st.button("Next ➡", on_click=lambda: go_to_step(5))
+
+    # --------------------------------------------------------------
+    # STEP 5 – Costs & taxes
+    # --------------------------------------------------------------
+    elif step == 5:
+        st.header("Step 5 – Costs & taxes")
+
+        st.markdown(
+            """
+To get **realistic results**, we need to account for fees and (eventually) tax.
+
+Right now the engine **applies fees** as a continuous drag on portfolio returns.  
+Tax settings are captured here for future use when we switch to a full **position-based tax engine**.
+"""
+        )
+
+        st.subheader("Fees")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.checkbox(
+                "Apply an annual fee to the portfolio?",
+                key="fees_apply",
+            )
+        with col2:
+            st.slider(
+                "Annual fee (basis points)",
+                min_value=0.0,
+                max_value=300.0,
+                step=5.0,
+                key="fees_annual_bps",
+                help="100 bps = 1.00% p.a. This is applied as a smooth drag on returns.",
+            )
+
+        st.subheader("Tax (for future position-based engine)")
+
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            st.checkbox(
+                "Capture capital gains tax settings?",
+                key="tax_apply",
+                help="These values are stored in the config but not yet applied to returns.",
+            )
+        with col4:
+            st.number_input(
+                "STCG rate (%)",
+                min_value=0.0,
+                max_value=50.0,
+                step=0.5,
+                key="tax_stcg_rate",
+            )
+        with col5:
+            st.number_input(
+                "LTCG rate (%)",
+                min_value=0.0,
+                max_value=50.0,
+                step=0.5,
+                key="tax_ltcg_rate",
+            )
+
+        st.number_input(
+            "LTCG minimum holding period (days)",
+            min_value=0,
+            max_value=3650,
+            step=1,
+            key="tax_ltcg_days",
+            help="Gains on holdings beyond this age will be treated as long-term for tax purposes.",
+        )
+
+        st.info(
+            "For now, only fees are actually applied. Tax settings are recorded in the BacktestConfig so that future versions of the engine can honour them exactly per trade."
+        )
+
+        st.markdown("---")
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            st.button("⬅ Previous", on_click=lambda: go_to_step(4))
+        with col_next:
+            st.button("Next ➡", on_click=lambda: go_to_step(6))
+
+    # --------------------------------------------------------------
+    # STEP 6 – Review & run
+    # --------------------------------------------------------------
+    elif step == 6:
+        st.header("Step 6 – Review & run")
+
+        st.markdown("First, give this backtest run a short, memorable name:")
+
+        st.text_input(
+            "Run name (used for CSV filenames and identification)",
+            key="run_name",
+        )
+
+        cfg = build_config_from_state()
+
+        st.subheader("Summary of your backtest setup")
+
+        # Display a compact summary table of key parameters
+        summary_rows = []
+
+        entry_sel_mode = cfg.selection.mode
+        entry_top_n = cfg.selection.top_n if entry_sel_mode == "top_n" else None
+
+        reb_mode = cfg.rebalance_selection.mode if cfg.rebalance_selection else None
+        reb_top_n = (
+            cfg.rebalance_selection.top_n
+            if cfg.rebalance_selection and cfg.rebalance_selection.mode == "top_n"
+            else None
+        )
+
+        summary_rows.append(
+            {
+                "Parameter": "Backtest mode",
+                "Value": "Single" if cfg.mode == "single" else "Rolling cohorts",
+            }
+        )
+        summary_rows.append(
+            {
+                "Parameter": "Study window",
+                "Value": f"{cfg.study_window.start} → {cfg.study_window.end}",
+            }
+        )
+        if cfg.mode == "rolling_cohort" and cfg.cohorts is not None:
+            summary_rows.append(
+                {
+                    "Parameter": "Cohort frequency",
+                    "Value": cfg.cohorts.start_frequency,
+                }
+            )
+            summary_rows.append(
+                {
+                    "Parameter": "Cohort horizon (years)",
+                    "Value": cfg.cohorts.horizon_years,
+                }
+            )
+
+        summary_rows.append(
+            {"Parameter": "Universe preset", "Value": cfg.universe.preset}
+        )
+        summary_rows.append(
+            {
+                "Parameter": "Entry signal",
+                "Value": f"{cfg.signal.name} (direction={cfg.signal.direction})",
+            }
+        )
+        if entry_sel_mode == "top_n":
+            summary_rows.append(
+                {
+                    "Parameter": "Entry selection",
+                    "Value": f"Top {entry_top_n}, min {cfg.selection.min_funds}",
+                }
+            )
+        else:
+            summary_rows.append(
+                {
+                    "Parameter": "Entry selection",
+                    "Value": f"All eligible, min {cfg.selection.min_funds}",
+                }
+            )
+
+        summary_rows.append(
+            {
+                "Parameter": "Rebalance frequency",
+                "Value": cfg.rebalance.frequency,
+            }
+        )
+
+        if cfg.rebalance.frequency != "NONE":
+            if cfg.rebalance_signal is None:
+                summary_rows.append(
+                    {
+                        "Parameter": "Rebalance criteria",
+                        "Value": "Same as entry selection",
+                    }
+                )
+            else:
+                summary_rows.append(
+                    {
+                        "Parameter": "Rebalance signal",
+                        "Value": f"{cfg.rebalance_signal.name} (direction={cfg.rebalance_signal.direction})",
+                    }
+                )
+                if reb_mode == "top_n":
+                    summary_rows.append(
+                        {
+                            "Parameter": "Rebalance selection",
+                            "Value": f"Top {reb_top_n}, min {cfg.rebalance_selection.min_funds}",
+                        }
+                    )
+                else:
+                    summary_rows.append(
+                        {
+                            "Parameter": "Rebalance selection",
+                            "Value": f"All eligible, min {cfg.rebalance_selection.min_funds}",
+                        }
+                    )
+
+        summary_rows.append(
+            {
+                "Parameter": "Fees applied?",
+                "Value": f"{cfg.fees.apply} (annual_bps={cfg.fees.annual_bps})",
+            }
+        )
+        summary_rows.append(
+            {
+                "Parameter": "Tax settings captured?",
+                "Value": f"{cfg.tax.apply} (stcg={cfg.tax.stcg_rate*100:.1f}%, ltcg={cfg.tax.ltcg_rate*100:.1f}% after {cfg.tax.ltcg_holding_days} days)",
+            }
+        )
+
+        st.table(pd.DataFrame(summary_rows))
+
+        # English description of the research question
+        question_text = describe_backtest(
+            mode=cfg.mode,
+            start_date=cfg.study_window.start,
+            end_date=cfg.study_window.end,
+            universe_preset=cfg.universe.preset,
+            entry_signal_name=cfg.signal.name,
+            entry_direction=cfg.signal.direction,
+            entry_mode=cfg.selection.mode,
+            entry_top_n=cfg.selection.top_n if cfg.selection.mode == "top_n" else None,
+            rebalance_freq=cfg.rebalance.frequency,
+            has_separate_rebalance=cfg.rebalance_signal is not None,
+            rebalance_signal_name=cfg.rebalance_signal.name if cfg.rebalance_signal else None,
+            rebalance_direction=cfg.rebalance_signal.direction if cfg.rebalance_signal else None,
+            rebalance_mode=reb_mode,
+            rebalance_top_n=reb_top_n,
+            cohort_start_freq=cfg.cohorts.start_frequency if cfg.cohorts else None,
+            cohort_horizon_years=cfg.cohorts.horizon_years if cfg.cohorts else None,
+            fees_apply=cfg.fees.apply,
+            fees_annual_bps=cfg.fees.annual_bps,
+        )
+
+        st.subheader("In plain English, this backtest is asking:")
+        st.markdown(f"> {question_text}")
+
+        st.markdown("---")
+
+        col_prev, col_run = st.columns(2)
+        with col_prev:
+            st.button("⬅ Previous", on_click=lambda: go_to_step(5))
+
+        run_clicked = col_run.button("🚀 Run backtest")
+
+        if run_clicked:
+            st.markdown("### Running backtest…")
+            provider = PostgresDataProvider()
+            engine = BacktestEngine(provider)
+
+            try:
+                result = engine.run(cfg)
+            except RuntimeError as e:
+                st.error(
+                    f"Backtest failed: {e}\n\n"
+                    "Common causes:\n"
+                    "- SSH tunnel / Postgres connection not running\n"
+                    "- PGPASSWORD / other PG* env vars not exported in the terminal\n"
+                    "- Universe too restrictive (no eligible funds on some dates)\n"
+                )
+                return
+            except Exception as e:
+                st.exception(e)
+                return
+
+            st.success("Backtest completed successfully ✅")
+
+            # Show summary & periods
+            st.subheader("Backtest summary")
+            st.dataframe(result.summary)
+
+            with st.expander("Period-by-period breakdown"):
+                st.dataframe(result.portfolio_periods)
+
+            # Save CSVs
+            paths = result.save(OUTPUT_DIR, level="standard")
+            st.markdown("### Outputs saved")
+            for label, path in paths.items():
+                st.write(f"- **{label}** → `{path.relative_to(PROJECT_ROOT)}`")
+
+            st.info(
+                "You can now analyse these CSVs in notebooks, Excel, or link them back into your Notion Variant pages."
+            )
 
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## 02_frontend.ipynb
@@ -925,6 +1426,118 @@ def run_sql(query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame
 
 ```
 
+## app_settings.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Dict, List
+
+import yaml
+
+
+# Location for app-level config (will be committed to git if you add it)
+SETTINGS_PATH = Path("config/app_settings.yaml")
+UNIVERSES_PATH = Path("config/universe_presets.yaml")
+
+
+@dataclass
+class FeeSettings:
+    apply: bool = True
+    annual_bps: float = 100.0  # 1% p.a.
+
+
+@dataclass
+class TaxSettings:
+    apply: bool = False
+    stcg_rate: float = 0.15    # 15%
+    ltcg_rate: float = 0.10    # 10%
+    ltcg_holding_days: int = 365
+
+
+@dataclass
+class AppSettings:
+    fees: FeeSettings = field(default_factory=FeeSettings)
+    tax: TaxSettings = field(default_factory=TaxSettings)
+
+
+def load_app_settings() -> AppSettings:
+    if not SETTINGS_PATH.exists():
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        settings = AppSettings()
+        save_app_settings(settings)
+        return settings
+
+    with SETTINGS_PATH.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    # Very defensive unpacking
+    fees = data.get("fees", {}) or {}
+    tax = data.get("tax", {}) or {}
+
+    fee_settings = FeeSettings(
+        apply=fees.get("apply", True),
+        annual_bps=float(fees.get("annual_bps", 100.0)),
+    )
+    tax_settings = TaxSettings(
+        apply=tax.get("apply", False),
+        stcg_rate=float(tax.get("stcg_rate", 0.15)),
+        ltcg_rate=float(tax.get("ltcg_rate", 0.10)),
+        ltcg_holding_days=int(tax.get("ltcg_holding_days", 365)),
+    )
+
+    return AppSettings(fees=fee_settings, tax=tax_settings)
+
+
+def save_app_settings(settings: AppSettings) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with SETTINGS_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "fees": asdict(settings.fees),
+                "tax": asdict(settings.tax),
+            },
+            f,
+            sort_keys=False,
+        )
+
+
+# ---------- Universe presets ----------
+
+def load_universe_presets() -> Dict[str, dict]:
+    """Return mapping: preset_name -> preset_dict."""
+    if not UNIVERSES_PATH.exists():
+        UNIVERSES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Seed with your current default universe
+        presets = {
+            "equity_active_direct": {
+                "description": "Equity, Active, Direct, investible, growth (current hard-coded universe).",
+                "asset_types": ["Equity"],
+                "include_categories": [],
+                "exclude_categories": [],
+                "only_direct": True,
+                "only_active": True,
+                "investible_only": True,
+                "growth_only": True,
+            }
+        }
+        save_universe_presets(presets)
+        return presets
+
+    with UNIVERSES_PATH.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    return data.get("universes", {})
+
+
+def save_universe_presets(presets: Dict[str, dict]) -> None:
+    UNIVERSES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with UNIVERSES_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump({"universes": presets}, f, sort_keys=False)
+```
+
 ## config.py
 
 ```python
@@ -934,21 +1547,34 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, Literal, Optional
 
+# ---------------------------------------------------------------------
+# Core enums / type aliases
+# ---------------------------------------------------------------------
 
-RebalanceFreq = Literal["NONE", "3M", "6M", "12M", "18M", "24M"]
+RebalanceFreq = Literal["NONE", "1M", "3M", "6M", "12M", "18M", "24M"]
+BacktestMode = Literal["single", "rolling_cohort"]
 
+
+# ---------------------------------------------------------------------
+# Study window / universe
+# ---------------------------------------------------------------------
 
 @dataclass
 class StudyWindow:
-    start: Optional[date] = None   # None = auto_min
-    end: Optional[date] = None     # None = auto_max
+    start: Optional[date] = None   # None = auto_min (not used yet)
+    end: Optional[date] = None     # None = auto_max (not used yet)
 
 
 @dataclass
 class UniverseConfig:
-    # Either use a preset name OR raw filters (we'll implement presets later)
+    # Either use a preset name OR raw filters (we'll implement filters later)
     preset: Optional[str] = None
     filters: Dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------
+# Signal / selection / rebalancing
+# ---------------------------------------------------------------------
 
 @dataclass
 class SignalConfig:
@@ -959,8 +1585,8 @@ class SignalConfig:
     1) Simple column mode (current behaviour):
        - Use `name`, `source`, `lookback_months`, `rank_scope`, etc.
        - Leave `expression` and `filter_expression` as None.
-       - Engine will resolve a single column via _resolve_signal_column()
-         and use that as `score`.
+       - DataProvider.get_signal_scores() will resolve a single column
+         via _resolve_signal_column() and use that as `score`.
 
     2) Expression mode:
        - Set `expression` to a formula using columns in performance_ranking,
@@ -970,8 +1596,9 @@ class SignalConfig:
        - `name` becomes just a logical label for this signal.
 
     direction:
-       - "asc": lower score is better (e.g. ranks).
-       - "desc": higher score is better (e.g. returns).
+       - "asc": lower raw value is better (e.g. rank_1y_category).
+       - "desc": higher raw value is better (e.g. perf_1y).
+       Internally we normalise so that *higher score is always better*.
     """
     name: str                       # e.g. "rank_12m_category"
     source: str = "performance_ranking"
@@ -1012,14 +1639,27 @@ class SelectionConfig:
 
 @dataclass
 class RebalanceConfig:
+    """Configuration for WHEN rebalancing happens.
+
+    frequency:
+      - "NONE" => buy-and-hold (single portfolio from start to end).
+      - "1M", "3M", "6M", ... => rebalance on a fixed calendar schedule.
+
+    anchor:
+      - currently informational; we always anchor to the provided start date.
+    """
     frequency: RebalanceFreq = "12M"
     anchor: Literal["month_end"] = "month_end"
 
 
+# ---------------------------------------------------------------------
+# Fee & tax config (tax still plumbing-only in engine)
+# ---------------------------------------------------------------------
+
 @dataclass
 class FeeConfig:
     apply: bool = False
-    annual_bps: float = 0.0   # 50 = 0.50% p.a.
+    annual_bps: float = 0.0   # 100 = 1.00% p.a.
     apply_frequency: Literal["daily", "monthly", "annual"] = "daily"
 
 
@@ -1031,25 +1671,74 @@ class TaxConfig:
     ltcg_holding_days: int = 365
 
 
+# ---------------------------------------------------------------------
+# Cohort (rolling) config
+# ---------------------------------------------------------------------
+
+@dataclass
+class CohortConfig:
+    """Controls rolling-cohort experiments.
+
+    Example: monthly cohorts with 3-year holding horizon.
+
+    start_frequency:
+      - How often we start a new cohort (usually "1M" or "3M").
+
+    horizon_years:
+      - Target holding horizon for each cohort; internally converted to months.
+
+    Notes:
+      - Engine will truncate the last cohort if it would run past study_window.end.
+      - For now we always reuse the same rebalance rules *inside* each cohort.
+    """
+    start_frequency: Literal["1M", "3M", "6M", "12M"] = "1M"
+    horizon_years: float = 3.0
+
+
+# ---------------------------------------------------------------------
+# Top-level backtest config
+# ---------------------------------------------------------------------
+
 @dataclass
 class BacktestConfig:
-    """Top-level config object for a single backtest run.
+    """Top-level config object for a single logical backtest.
 
-    This should be directly mappable from your Notion Variant row.
+    This is what a Notion Variant row should map to.
+
+    Modes:
+      - mode="single":  traditional backtest over study_window, with optional
+                        rebalancing according to `rebalance`.
+      - mode="rolling_cohort": rolling cohorts inside study_window; each cohort
+                               uses the same universe/signal/selection rules,
+                               but with its own cohort [start, start+horizon).
+
+    For rolling_cohort mode you must provide `cohorts`.
     """
 
+    # --- required core pieces (no defaults) ---
     name: str
     study_window: StudyWindow
     universe: UniverseConfig
     signal: SignalConfig
     selection: SelectionConfig
     rebalance: RebalanceConfig
+
+    # --- mode / cohorts ---
+    mode: BacktestMode = "single"
+    cohorts: Optional[CohortConfig] = None
+
+    # --- fees & tax ---
     fees: FeeConfig = field(default_factory=FeeConfig)
     tax: TaxConfig = field(default_factory=TaxConfig)
 
+    # --- optional separate rebalance criteria ---
+    # If provided, these are used from the second period onwards.
+    # The *initial* portfolio always uses `signal` + `selection`.
+    rebalance_signal: Optional[SignalConfig] = None
+    rebalance_selection: Optional[SelectionConfig] = None
+
     # free-form metadata (links to Notion, code, etc.)
     metadata: Dict[str, Any] = field(default_factory=dict)
-
 ```
 
 ## formula.py
@@ -1697,16 +2386,18 @@ __all__ = [
 ```python
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 from .config import BacktestConfig
 from .data_provider import DataProvider
 from .utils.dates import generate_rebalance_dates
+
 
 class BacktestResult:
     """Container for engine outputs and helper methods.
@@ -1716,11 +2407,12 @@ class BacktestResult:
     run_id : str
         Identifier for this run (typically config.name).
     summary : pd.DataFrame
-        One row per run, with total returns, CAGR, alpha, etc.
+        For single mode: one row per run.
+        For rolling_cohort mode: one row per cohort.
     portfolio_periods : pd.DataFrame
-        One row per rebalance period with period-level returns.
+        One row per rebalance period (and per cohort, if rolling).
     holdings : pd.DataFrame
-        One row per fund per period with weights and period returns.
+        One row per fund per period (and per cohort, if rolling).
     config : Optional[BacktestConfig]
         Optional copy of the BacktestConfig used to run this backtest.
     """
@@ -1798,24 +2490,56 @@ class BacktestResult:
 
         return paths
 
+
 class BacktestEngine:
     """Core engine orchestrator.
 
-    Current capabilities:
-      - Single portfolio over a study window, with optional rebalancing.
-      - Universe via DataProvider.get_universe().
-      - Signals via DataProvider.get_signal_scores() (no lookahead).
-      - SelectionConfig: mode="top_n" or "all", equal-weight.
-      - NAV walking via DataProvider.get_nav_series().
-      - Benchmark (Nifty 500 TRI) via DataProvider.get_benchmark_series().
-      - Optional fee drag via BacktestConfig.fees (no tax yet).
+    Current capabilities
+    --------------------
+    - mode="single"
+        * Single portfolio over a study window, with optional rebalancing.
+        * Universe via DataProvider.get_universe().
+        * Signals via DataProvider.get_signal_scores() (no lookahead).
+        * SelectionConfig: mode="top_n" or "all", equal-weight.
+        * NAV walking via DataProvider.get_nav_series().
+        * Benchmark (Nifty 500 TRI) via DataProvider.get_benchmark_series().
+        * Optional fee drag via BacktestConfig.fees (no tax yet).
+
+        You can optionally provide `rebalance_signal` / `rebalance_selection`
+        to use different criteria from the 2nd period onwards.
+
+    - mode="rolling_cohort"
+        * Rolling cohorts inside study_window.
+        * Each cohort is just a single-mode run with its own [start, end].
+        * Cohorts are started every `cohorts.start_frequency` (e.g. "1M")
+          and each cohort has a holding horizon of `cohorts.horizon_years`.
+        * Summary/periods/holdings include `cohort_no`, `cohort_start`,
+          `cohort_end` columns so you can analyse distributions.
     """
 
     def __init__(self, data_provider: DataProvider):
         self.data_provider = data_provider
 
+    # ------------------------------------------------------------------
+    # Public entrypoint
+    # ------------------------------------------------------------------
+
     def run(self, config: BacktestConfig) -> BacktestResult:
-        """Run a backtest for a single portfolio, possibly with rebalancing."""
+        """Run a backtest in the requested mode."""
+        mode = getattr(config, "mode", "single")
+
+        if mode == "single":
+            return self._run_single(config)
+        elif mode == "rolling_cohort":
+            return self._run_rolling_cohorts(config)
+        else:
+            raise ValueError(f"Unsupported BacktestConfig.mode={mode!r}")
+
+    # ------------------------------------------------------------------
+    # Single backtest (current behaviour, extended slightly)
+    # ------------------------------------------------------------------
+
+    def _run_single(self, config: BacktestConfig) -> BacktestResult:
         run_id = config.name
 
         if config.study_window.start is None or config.study_window.end is None:
@@ -1860,6 +2584,14 @@ class BacktestEngine:
             )
             period_days = (period_end - period_start).days
 
+            # Decide which signal/selection to use
+            if period_no == 1:
+                signal_cfg = config.signal
+                selection_cfg = config.selection
+            else:
+                signal_cfg = config.rebalance_signal or config.signal
+                selection_cfg = config.rebalance_selection or config.selection
+
             # 1) Get investible universe on the rebalance date
             universe_df = self.data_provider.get_universe(
                 rebalance_date, config.universe
@@ -1871,36 +2603,38 @@ class BacktestEngine:
             scores_df = self.data_provider.get_signal_scores(
                 as_of=rebalance_date,
                 schemecodes=universe_df["schemecode"].tolist(),
-                signal_config=config.signal,
+                signal_config=signal_cfg,
             )
 
             merged = (
                 universe_df.merge(scores_df, on="schemecode", how="inner")
-                .sort_values("score", ascending=(config.signal.direction == "asc"))
+                # IMPORTANT: score is already "higher is better" from provider,
+                # so we always sort descending.
+                .sort_values("score", ascending=False)
             )
 
             # Selection modes
-            if config.selection.mode == "top_n":
-                top = merged.head(config.selection.top_n).copy()
-            elif config.selection.mode == "all":
+            if selection_cfg.mode == "top_n":
+                top = merged.head(selection_cfg.top_n).copy()
+            elif selection_cfg.mode == "all":
                 top = merged.copy()
             else:
                 raise ValueError(
-                    f"Unsupported selection.mode={config.selection.mode!r}"
+                    f"Unsupported selection.mode={selection_cfg.mode!r}"
                 )
 
             n = len(top)
 
-            if n < config.selection.min_funds:
+            if n < selection_cfg.min_funds:
                 raise RuntimeError(
                     f"Only {n} eligible funds on {rebalance_date}, "
-                    f"min_funds={config.selection.min_funds}"
+                    f"min_funds={selection_cfg.min_funds}"
                 )
 
             # 3) We currently only support equal-weight portfolios
-            if config.selection.weight_scheme != "equal":
+            if selection_cfg.weight_scheme != "equal":
                 raise ValueError(
-                    f"Unsupported weight_scheme={config.selection.weight_scheme!r}"
+                    f"Unsupported weight_scheme={selection_cfg.weight_scheme!r}"
                 )
             top["weight"] = 1.0 / n
 
@@ -2086,6 +2820,117 @@ class BacktestEngine:
             holdings=holdings,
             config=config,
         )
+
+    # ------------------------------------------------------------------
+    # Rolling-cohort mode
+    # ------------------------------------------------------------------
+
+    def _run_rolling_cohorts(self, config: BacktestConfig) -> BacktestResult:
+        """Run rolling cohorts inside the study_window.
+
+        Each cohort:
+          - Starts at some date t0 within [window_start, window_end)
+          - Has end date t1 = min(t0 + horizon, window_end)
+          - Is run as an independent single-mode backtest (same rules)
+        """
+        if config.cohorts is None:
+            raise ValueError(
+                "BacktestConfig.mode='rolling_cohort' requires config.cohorts"
+            )
+
+        if config.study_window.start is None or config.study_window.end is None:
+            raise ValueError("study_window.start and end must be set")
+
+        window_start: date = config.study_window.start
+        window_end: date = config.study_window.end
+
+        # 1) Generate cohort start dates using the same calendar generator
+        cohort_starts = generate_rebalance_dates(
+            start=window_start,
+            end=window_end,
+            frequency=config.cohorts.start_frequency,
+        )
+
+        # 2) Convert horizon_years -> months and build relativedelta
+        horizon_months = int(round(config.cohorts.horizon_years * 12))
+        if horizon_months <= 0:
+            raise ValueError(
+                f"Invalid cohorts.horizon_years={config.cohorts.horizon_years}; "
+                "must be > 0."
+            )
+        horizon_delta = relativedelta(months=horizon_months)
+
+        all_summary: List[pd.DataFrame] = []
+        all_periods: List[pd.DataFrame] = []
+        all_holdings: List[pd.DataFrame] = []
+
+        cohort_no = 0
+
+        for t0 in cohort_starts:
+            t1 = t0 + horizon_delta
+            if t1 > window_end:
+                t1 = window_end
+            if t1 <= t0:
+                # horizon is too short; skip this cohort
+                continue
+
+            cohort_no += 1
+            sub_window = config.study_window.__class__(start=t0, end=t1)
+
+            # Build a sub-config that behaves like a single-mode run
+            sub_cfg = replace(
+                config,
+                study_window=sub_window,
+                mode="single",
+                cohorts=None,
+            )
+
+            sub_result = self._run_single(sub_cfg)
+
+            # Annotate with cohort metadata
+            s = sub_result.summary.copy()
+            s["cohort_no"] = cohort_no
+            s["cohort_start"] = t0
+            s["cohort_end"] = t1
+
+            p = sub_result.portfolio_periods.copy()
+            p["cohort_no"] = cohort_no
+            p["cohort_start"] = t0
+            p["cohort_end"] = t1
+
+            h = sub_result.holdings.copy()
+            if not h.empty:
+                h["cohort_no"] = cohort_no
+                h["cohort_start"] = t0
+                h["cohort_end"] = t1
+
+            all_summary.append(s)
+            all_periods.append(p)
+            if not h.empty:
+                all_holdings.append(h)
+
+        if not all_summary:
+            raise RuntimeError(
+                "No cohorts generated. Check study_window and cohorts settings."
+            )
+
+        summary = pd.concat(all_summary, ignore_index=True)
+        portfolio_periods = pd.concat(all_periods, ignore_index=True)
+        holdings = (
+            pd.concat(all_holdings, ignore_index=True)
+            if all_holdings
+            else pd.DataFrame()
+        )
+
+        # Note: run_id is still the *parent* run name; cohort-specific info
+        # lives in the extra columns.
+        return BacktestResult(
+            run_id=config.name,
+            summary=summary,
+            portfolio_periods=portfolio_periods,
+            holdings=holdings,
+            config=config,
+        )
 ```
 
 ## data_provider.py
@@ -2245,6 +3090,7 @@ def _months_for_frequency(frequency: str) -> int:
     if frequency == "NONE":
         return 0
     mapping = {
+        "1M": 1,
         "3M": 3,
         "6M": 6,
         "12M": 12,
@@ -2286,6 +3132,5 @@ def generate_rebalance_dates(start: date, end: date, frequency: str) -> List[dat
         dates.append(current)
 
     return dates
-
 ```
 
