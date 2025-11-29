@@ -5,3 +5,4 @@ psycopg2-binary
 PyYAML>=6.0
 python-dateutil
 tqdm
+streamlit>=1.40

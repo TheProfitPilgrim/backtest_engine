@@ -1,0 +1,7 @@
+# Virtual env (if not already handled globally)
+.venv/
+
+# Backtest outputs
+notebooks/batch_outputs/
+notebooks/outputs/
+backtests/

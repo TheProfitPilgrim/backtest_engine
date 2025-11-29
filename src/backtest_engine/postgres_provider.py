@@ -8,7 +8,7 @@ import pandas as pd
 
 from .data_provider import DataProvider
 from .config import UniverseConfig, SignalConfig
-from .db import run_sql
+from .db import run_sql, get_engine
 
 _BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 
@@ -146,7 +146,7 @@ class PostgresDataProvider(DataProvider):
         raise NotImplementedError(
             f"Signal '{signal_config.name}' not mapped to a column yet."
         )
-    
+
     def get_signal_scores(
         self,
         as_of: date,
@@ -202,18 +202,28 @@ class PostgresDataProvider(DataProvider):
         if "rn" in df.columns:
             df = df.drop(columns=["rn"])
 
+        # 2.5) Load allowed field metadata from performance_ranking
+        #      (this enforces that formulas only use valid columns)
+        engine = get_engine()
+        field_registry = load_selection_field_registry(engine)
+
         # 3) Apply optional filter_expression (on the snapshot)
         if signal_config.filter_expression:
             expr = signal_config.filter_expression
-            env = {col: df[col] for col in df.columns}
             try:
-                mask = pd.eval(expr, local_dict=env, engine="python")
-            except Exception as exc:
+                mask = evaluate_formula_on_df(
+                    df=df,
+                    formula=expr,
+                    allowed_fields=field_registry,
+                )
+            except (FormulaSyntaxError, FormulaNameError, Exception) as exc:
                 raise ValueError(
                     f"Error evaluating filter_expression={expr!r} "
                     f"on performance_ranking snapshot"
                 ) from exc
 
+            # Ensure boolean; treat NaNs as False
+            mask = mask.astype(bool).fillna(False)
             df = df[mask]
 
             if df.empty:
@@ -224,10 +234,13 @@ class PostgresDataProvider(DataProvider):
         # 4) Compute 'score' either from expression or from a resolved column
         if signal_config.expression:
             expr = signal_config.expression
-            env = {col: df[col] for col in df.columns}
             try:
-                scores = pd.eval(expr, local_dict=env, engine="python")
-            except Exception as exc:
+                scores = evaluate_formula_on_df(
+                    df=df,
+                    formula=expr,
+                    allowed_fields=field_registry,
+                )
+            except (FormulaSyntaxError, FormulaNameError, Exception) as exc:
                 raise ValueError(
                     f"Error evaluating signal expression={expr!r} "
                     f"on performance_ranking snapshot"
@@ -245,6 +258,10 @@ class PostgresDataProvider(DataProvider):
                 )
             df = df.copy()
             df["score"] = df[col]
+
+        # 5) Apply direction: "asc" = lower is better, "desc" = higher is better
+        if signal_config.direction == "asc":
+            df["score"] = -df["score"]
 
         # Final output: schemecode + score
         return df[["schemecode", "score"]]
