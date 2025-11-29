@@ -59,6 +59,391 @@ create_markdown_from_code(root_directory, output_markdown)
 print(f"Markdown file '{output_markdown}' has been created with all code.")
 ```
 
+## streamlit_app.py
+
+```python
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+import os
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
+
+from backtest_engine import BacktestEngine, PostgresDataProvider, run_batch
+from backtest_engine.config import (
+    BacktestConfig,
+    StudyWindow,
+    UniverseConfig,
+    SignalConfig,
+    SelectionConfig,
+    RebalanceConfig,
+    FeeConfig,
+)
+
+# Root folder for saved runs (relative to repo root)
+BACKTEST_ROOT = Path("backtests")
+
+# Default DB env vars (for local development)
+DEFAULT_DB_ENV = {
+    "PGHOST": "localhost",
+    "PGPORT": "5433",
+    "PGDATABASE": "kairo_production",
+    "PGUSER": "sanjay_readonly",
+    "PGPASSWORD": "Piper112358!",
+}
+
+# Set defaults only if not already set in the environment
+for key, value in DEFAULT_DB_ENV.items():
+    if not os.getenv(key):
+        os.environ[key] = value
+
+def make_config(
+    name: str,
+    start: date,
+    end: date,
+    universe_preset: str,
+    signal_mode: str,
+    signal_name: str,
+    signal_direction: str,
+    expression: Optional[str],
+    filter_expression: Optional[str],
+    selection_mode: str,
+    top_n: int,
+    min_funds: int,
+    weight_scheme: str,
+    rebalance_freq: str,
+    apply_fee: bool,
+    fee_bps: float,
+) -> BacktestConfig:
+    """Build a BacktestConfig from UI inputs."""
+    # Build SignalConfig depending on mode
+    if signal_mode == "simple":
+        signal_cfg = SignalConfig(
+            name=signal_name,
+            direction=signal_direction,
+        )
+    else:
+        signal_cfg = SignalConfig(
+            name="expression",
+            expression=expression or "",
+            filter_expression=filter_expression or "",
+            direction=signal_direction,
+        )
+
+    selection_cfg = SelectionConfig(
+        mode=selection_mode,
+        top_n=top_n,
+        min_funds=min_funds,
+        weight_scheme=weight_scheme,
+    )
+
+    cfg = BacktestConfig(
+        name=name,
+        study_window=StudyWindow(start=start, end=end),
+        universe=UniverseConfig(preset=universe_preset),
+        signal=signal_cfg,
+        selection=selection_cfg,
+        rebalance=RebalanceConfig(frequency=rebalance_freq),
+        fees=FeeConfig(
+            apply=apply_fee,
+            annual_bps=fee_bps,
+        ),
+    )
+    return cfg
+
+
+def save_to_index(result_summary: pd.DataFrame, run_dir: Path, save_level: str) -> None:
+    """Append this run to backtests/index.csv for easy browsing later."""
+    BACKTEST_ROOT.mkdir(parents=True, exist_ok=True)
+    index_path = BACKTEST_ROOT / "index.csv"
+
+    summary = result_summary.copy()
+    summary["output_dir"] = str(run_dir)
+    summary["save_level"] = save_level
+
+    if index_path.exists():
+        existing = pd.read_csv(index_path)
+        combined = pd.concat([existing, summary], ignore_index=True)
+    else:
+        combined = summary
+
+    combined.to_csv(index_path, index=False)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="MF Backtest Engine",
+        layout="wide",
+    )
+
+    st.title("📈 Mutual Fund Backtest Engine")
+
+    st.markdown(
+        "This UI wraps the `backtest_engine` package.\n\n"
+        "Make sure your SSH tunnel to the Kairo DB is running and PG* env vars are set "
+        "before running backtests."
+    )
+
+    tabs = st.tabs(["Run backtest", "Saved backtests"])
+
+    # -------------------------------------------------------------------------
+    # TAB 1: RUN BACKTEST
+    # -------------------------------------------------------------------------
+    with tabs[0]:
+        st.header("Run a new backtest")
+
+        col_run_left, col_run_right = st.columns(2)
+
+        with col_run_left:
+            st.subheader("Universe & dates")
+
+            run_name = st.text_input(
+                "Run name",
+                value="mf-10y-annual-top15-net1%",
+                help="Used for folder names and file prefixes.",
+            )
+
+            universe_preset = st.selectbox(
+                "Universe preset",
+                options=["equity_active_direct"],
+                index=0,
+                help="More presets can be added later.",
+            )
+
+            start_date = st.date_input(
+                "Start date",
+                value=date(2014, 1, 1),
+            )
+            end_date = st.date_input(
+                "End date",
+                value=date(2024, 1, 1),
+            )
+
+            if start_date >= end_date:
+                st.error("Start date must be before end date.")
+
+            st.subheader("Rebalancing")
+
+            rebalance_freq = st.selectbox(
+                "Rebalance frequency",
+                options=["NONE", "3M", "6M", "12M", "18M", "24M"],
+                index=3,  # default 12M
+            )
+
+            st.subheader("Fees")
+
+            apply_fee = st.checkbox(
+                "Apply annual fee?",
+                value=True,
+            )
+            fee_bps = st.slider(
+                "Fee (bps per year)",
+                min_value=0,
+                max_value=300,
+                value=100,
+                step=10,
+            )
+
+            save_level = st.selectbox(
+                "Output detail level",
+                options=["light", "standard", "full"],
+                index=1,
+                help="Full includes holdings & config; can be large.",
+            )
+
+        with col_run_right:
+            st.subheader("Signal (selection criteria)")
+
+            signal_mode = st.radio(
+                "Signal mode",
+                options=[
+                    "simple",
+                    "expression",
+                ],
+                format_func=lambda x: "Simple column" if x == "simple" else "Expression (formula-based)",
+            )
+
+            if signal_mode == "simple":
+                signal_name = st.text_input(
+                    "Signal column name",
+                    value="rank_12m_category",
+                    help="Must correspond to a column in performance_ranking.",
+                )
+                expression = None
+                filter_expression = None
+            else:
+                signal_name = "expression"
+                expression = st.text_area(
+                    "Score expression",
+                    value="perf_1y * 0.5 + perf_3y * 0.5",
+                    height=80,
+                    help="Use columns from performance_ranking (e.g. perf_1y, perf_3y, aum_cr, etc.).",
+                )
+                filter_expression = st.text_area(
+                    "Filter expression (optional)",
+                    value="aum_cr > 300 and age_years >= 3",
+                    height=60,
+                    help="Only funds where this is True will be eligible.",
+                )
+
+            signal_direction_label = st.radio(
+                "Signal direction",
+                options=["asc", "desc"],
+                format_func=lambda x: "Ascending (lower score is better)" if x == "asc" else "Descending (higher is better)",
+                index=0,
+            )
+            signal_direction = signal_direction_label  # already 'asc' or 'desc'
+
+            st.subheader("Selection")
+
+            selection_mode = st.radio(
+                "Selection mode",
+                options=["top_n", "all"],
+                format_func=lambda x: "Top N" if x == "top_n" else "All eligible",
+            )
+
+            if selection_mode == "top_n":
+                top_n = st.slider(
+                    "Top N funds",
+                    min_value=1,
+                    max_value=100,
+                    value=15,
+                    step=1,
+                )
+            else:
+                top_n = 999999  # effectively "all", but SelectionConfig will only use it for top_n mode
+
+            min_funds = st.slider(
+                "Minimum number of funds required",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+                help="If fewer eligible funds are found, the run will error out.",
+            )
+
+            weight_scheme = "equal"  # only equal-weight implemented for now
+            st.markdown("Weighting scheme: **equal-weight** (1/N) for now.")
+
+        run_button = st.button("🚀 Run backtest", type="primary")
+
+        if run_button:
+            with st.spinner("Running backtest..."):
+                try:
+                    provider = PostgresDataProvider()
+
+                    cfg = make_config(
+                        name=run_name,
+                        start=start_date,
+                        end=end_date,
+                        universe_preset=universe_preset,
+                        signal_mode=signal_mode,
+                        signal_name=signal_name,
+                        signal_direction=signal_direction,
+                        expression=expression,
+                        filter_expression=filter_expression,
+                        selection_mode=selection_mode,
+                        top_n=top_n,
+                        min_funds=min_funds,
+                        weight_scheme=weight_scheme,
+                        rebalance_freq=rebalance_freq,
+                        apply_fee=apply_fee,
+                        fee_bps=float(fee_bps),
+                    )
+
+                    engine = BacktestEngine(provider)
+                    result = engine.run(cfg)
+
+                    # Save outputs under backtests/<run_name>/
+                    run_dir = BACKTEST_ROOT / run_name
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    paths = result.save(run_dir, level=save_level)
+
+                    # Update index
+                    save_to_index(result.summary, run_dir, save_level)
+
+                    st.success("Backtest completed ✅")
+                    st.subheader("Summary")
+                    st.dataframe(result.summary)
+
+                    st.subheader("Period-level results (first 20 rows)")
+                    if "period_no" in result.portfolio_periods.columns:
+                        st.dataframe(
+                            result.portfolio_periods.head(20)
+                        )
+                    else:
+                        st.write("No period-level data available.")
+
+                    st.subheader("Saved files")
+                    for key, path in paths.items():
+                        st.write(f"- **{key}** → `{path}`")
+
+                except Exception as e:
+                    st.error(f"Backtest failed: {e!r}")
+
+    # -------------------------------------------------------------------------
+    # TAB 2: SAVED BACKTESTS
+    # -------------------------------------------------------------------------
+    with tabs[1]:
+        st.header("Saved backtests")
+
+        index_path = BACKTEST_ROOT / "index.csv"
+        if not index_path.exists():
+            st.info("No saved backtests yet. Run a backtest in the first tab.")
+            return
+
+        index_df = pd.read_csv(index_path)
+
+        if index_df.empty:
+            st.info("Index is empty. Run a backtest in the first tab.")
+            return
+
+        st.subheader("Backtest index")
+        st.dataframe(index_df)
+
+        run_names = index_df["run_id"].unique().tolist() if "run_id" in index_df.columns else []
+
+        if run_names:
+            selected_run = st.selectbox(
+                "Select a run to inspect",
+                options=run_names,
+            )
+            if selected_run:
+                # Find row for this run
+                row = index_df[index_df["run_id"] == selected_run].iloc[0]
+                run_dir = Path(row["output_dir"])
+
+                st.markdown(f"### Details for **{selected_run}**")
+                st.write(f"Output directory: `{run_dir}`")
+
+                # Try loading summary / periods / holdings
+                summary_path = run_dir / f"{selected_run}.summary.csv"
+                periods_path = run_dir / f"{selected_run}.periods.csv"
+                holdings_path = run_dir / f"{selected_run}.holdings.csv"
+
+                if summary_path.exists():
+                    st.subheader("Summary")
+                    st.dataframe(pd.read_csv(summary_path))
+
+                if periods_path.exists():
+                    st.subheader("Period-level results")
+                    st.dataframe(pd.read_csv(periods_path).head(50))
+
+                if holdings_path.exists():
+                    with st.expander("Holdings (first 100 rows)"):
+                        st.dataframe(pd.read_csv(holdings_path).head(100))
+        else:
+            st.info("No run_id column found in index.csv; cannot select runs.")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
 ## 02_frontend.ipynb
 
 ```python

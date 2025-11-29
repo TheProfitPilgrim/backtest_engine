@@ -6,3 +6,4 @@ PyYAML>=6.0
 python-dateutil
 tqdm
 streamlit>=1.40
+watchdog
