@@ -1,0 +1,49 @@
+{
+  "criteria": {
+    "rank_12m_category": {
+      "description": "Use 12-month performance rank within category; lower is better.",
+      "direction": "asc",
+      "expression": null,
+      "filter_expression": null,
+      "label": "12M Category Rank",
+      "lookback_months": 12,
+      "name": "rank_12m_category",
+      "rank_scope": "category",
+      "source": "performance_ranking",
+      "tie_breaker": null
+    }
+  },
+  "rebalances": {
+    "annual": {
+      "description": "Rebalance once a year using the chosen criteria.",
+      "frequency": "12M",
+      "label": "Annual rebalancing",
+      "name": "annual"
+    }
+  },
+  "selections": {
+    "top15_equal": {
+      "description": "Pick top 15 funds by criteria; require at least 10.",
+      "label": "Top 15 funds (equal-weight)",
+      "min_funds": 10,
+      "mode": "top_n",
+      "name": "top15_equal",
+      "top_n": 15,
+      "weight_scheme": "equal"
+    }
+  },
+  "universes": {
+    "equity_active_direct": {
+      "description": "Active equity mutual funds, direct plans only, status=Active, IsPurchaseAvailable=Y, excludes sector/thematic, ELSS, solution-oriented, liquid/overnight.",
+      "filters": {
+        "active_only": true,
+        "asset_classes": [
+          "Equity"
+        ],
+        "direct_only": true
+      },
+      "label": "Equity \u2013 Active \u2013 Direct (Investible)",
+      "name": "equity_active_direct"
+    }
+  }
+}

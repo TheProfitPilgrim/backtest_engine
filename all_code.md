@@ -400,8 +400,6 @@ Here you decide **how many portfolios** we simulate and **over what calendar win
                 key="mode",
             )
 
-            st.session_state.mode = mode_label
-
         with col2:
             st.session_state.study_start, st.session_state.study_end = st.date_input(
                 "Study window (start and end dates)",
