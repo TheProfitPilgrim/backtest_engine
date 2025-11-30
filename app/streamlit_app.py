@@ -21,6 +21,15 @@ from backtest_engine.config import (
 from backtest_engine.engine import BacktestEngine
 from backtest_engine.postgres_provider import PostgresDataProvider
 
+from backtest_engine.app_settings import (
+    AppSettings,
+    FeeSettings,
+    TaxSettings,
+    load_app_settings,
+    load_universe_presets,
+    save_app_settings,
+    save_universe_presets,
+)
 
 # -------------------------------------------------------------------
 # Paths & constants
@@ -150,10 +159,12 @@ def describe_backtest(
 # -------------------------------------------------------------------
 # Wizard helpers
 # -------------------------------------------------------------------
-
 def init_session_state():
     if "wizard_step" not in st.session_state:
         st.session_state.wizard_step = 1
+
+    # Load persisted app-level defaults (fees & tax)
+    app_settings = load_app_settings()
 
     # Basic fields defaults
     st.session_state.setdefault("run_name", "mf-10y-annual-top15")
@@ -161,7 +172,7 @@ def init_session_state():
     st.session_state.setdefault("study_start", date(2014, 1, 1))
     st.session_state.setdefault("study_end", date(2024, 1, 1))
 
-    # Universe
+    # Universe (wizard Step 2 will pull the options from YAML)
     st.session_state.setdefault("universe_preset", "equity_active_direct")
 
     # Entry signal & selection
@@ -174,9 +185,9 @@ def init_session_state():
     # Rebalance
     st.session_state.setdefault("rebalance_frequency", "12M")
     st.session_state.setdefault("use_separate_rebalance", False)
-    st.session_state.setdefault("reb_signal_name", "rank_12m_category")
-    st.session_state.setdefault("reb_signal_direction", "asc")
-    st.session_state.setdefault("reb_selection_mode", "top_n")
+    st.session_state.setdefault("rebalance_signal_name", "rank_12m_category")
+    st.session_state.setdefault("rebalance_signal_direction", "asc")
+    st.session_state.setdefault("rebalance_selection_mode", "top_n")
     st.session_state.setdefault("reb_top_n", 15)
     st.session_state.setdefault("reb_min_funds", 10)
 
@@ -184,19 +195,195 @@ def init_session_state():
     st.session_state.setdefault("cohort_start_frequency", "1M")
     st.session_state.setdefault("cohort_horizon_years", 3.0)
 
-    # Fees & tax
-    st.session_state.setdefault("fees_apply", False)
-    st.session_state.setdefault("fees_annual_bps", 100.0)
-    st.session_state.setdefault("tax_apply", False)
-    st.session_state.setdefault("tax_stcg_rate", 15.0)
-    st.session_state.setdefault("tax_ltcg_rate", 10.0)
-    st.session_state.setdefault("tax_ltcg_days", 365)
+    # Fees & tax – seed from app-level defaults defined in app_settings.yaml
+    st.session_state.setdefault("fees_apply", app_settings.fees.apply)
+    st.session_state.setdefault("fees_annual_bps", app_settings.fees.annual_bps)
 
+    st.session_state.setdefault("tax_apply", app_settings.tax.apply)
+    st.session_state.setdefault("tax_stcg_rate", app_settings.tax.stcg_rate)
+    st.session_state.setdefault("tax_ltcg_rate", app_settings.tax.ltcg_rate)
+    st.session_state.setdefault("tax_ltcg_days", app_settings.tax.ltcg_holding_days)
 
 def go_to_step(step: int):
     st.session_state.wizard_step = step
 
+# -------------------------------------------------------------------
+# Sidebar helpers: universe presets & app settings
+# -------------------------------------------------------------------
 
+def render_universe_presets_sidebar() -> None:
+    """Small CRUD UI for universe presets stored in universe_presets.yaml."""
+    presets = load_universe_presets()
+    if not presets:
+        # This will also seed the default preset
+        presets = load_universe_presets()
+
+    preset_names = sorted(presets.keys())
+    selected_name = st.selectbox(
+        "Edit preset",
+        options=preset_names,
+        key="sidebar_universe_preset_editor",
+    )
+
+    preset = presets[selected_name]
+
+    st.caption("Adjust the filters below and save as the same or a new name.")
+    desc = st.text_input(
+        "Description",
+        value=preset.get("description", ""),
+        key="sidebar_universe_desc",
+    )
+    asset_types_str = st.text_input(
+        "Asset types (comma-separated)",
+        value=", ".join(preset.get("asset_types", [])),
+        key="sidebar_universe_asset_types",
+    )
+    include_cats_str = st.text_input(
+        "Include categories (comma-separated; empty = all)",
+        value=", ".join(preset.get("include_categories", [])),
+        key="sidebar_universe_include_cats",
+    )
+    exclude_cats_str = st.text_input(
+        "Exclude categories (comma-separated)",
+        value=", ".join(preset.get("exclude_categories", [])),
+        key="sidebar_universe_exclude_cats",
+    )
+
+    only_direct = st.checkbox(
+        "Only direct plans",
+        value=preset.get("only_direct", True),
+        key="sidebar_universe_only_direct",
+    )
+    only_active = st.checkbox(
+        "Only active (exclude index/ETF)",
+        value=preset.get("only_active", True),
+        key="sidebar_universe_only_active",
+    )
+    investible_only = st.checkbox(
+        "Investible today only",
+        value=preset.get("investible_only", True),
+        key="sidebar_universe_investible_only",
+    )
+    growth_only = st.checkbox(
+        "Growth option only",
+        value=preset.get("growth_only", True),
+        key="sidebar_universe_growth_only",
+    )
+
+    new_name = st.text_input(
+        "Save as preset name",
+        value=selected_name,
+        key="sidebar_universe_new_name",
+        help="Change this to create a new preset based on the current one.",
+    )
+
+    col_save, col_delete = st.columns(2)
+    with col_save:
+        if st.button("💾 Save preset", key="sidebar_universe_save"):
+            name = new_name.strip()
+            if not name:
+                st.error("Preset name cannot be empty.")
+            else:
+                presets[name] = {
+                    "description": desc.strip(),
+                    "asset_types": [s.strip() for s in asset_types_str.split(",") if s.strip()],
+                    "include_categories": [s.strip() for s in include_cats_str.split(",") if s.strip()],
+                    "exclude_categories": [s.strip() for s in exclude_cats_str.split(",") if s.strip()],
+                    "only_direct": only_direct,
+                    "only_active": only_active,
+                    "investible_only": investible_only,
+                    "growth_only": growth_only,
+                }
+                save_universe_presets(presets)
+                st.session_state.universe_preset = name
+                st.success(f"Preset '{name}' saved.")
+
+    with col_delete:
+        if (
+            selected_name != "equity_active_direct"
+            and st.button("🗑 Delete", key="sidebar_universe_delete")
+        ):
+            presets.pop(selected_name, None)
+            save_universe_presets(presets)
+            st.success(f"Preset '{selected_name}' deleted.")
+
+
+def render_settings_sidebar() -> None:
+    """Edit app-level fee & tax defaults and persist them."""
+    app_settings = load_app_settings()
+
+    st.caption("Defaults used to seed the wizard's Step 5 fields.")
+
+    fees_apply = st.checkbox(
+        "Apply fees by default",
+        value=app_settings.fees.apply,
+        key="settings_fees_apply",
+    )
+    fees_bps = st.number_input(
+        "Annual fee (bps)",
+        min_value=0.0,
+        max_value=1000.0,
+        step=5.0,
+        value=float(app_settings.fees.annual_bps),
+        key="settings_fees_annual_bps",
+    )
+
+    tax_apply = st.checkbox(
+        "Apply tax by default",
+        value=app_settings.tax.apply,
+        key="settings_tax_apply",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        stcg_rate = st.number_input(
+            "STCG rate (%)",
+            min_value=0.0,
+            max_value=50.0,
+            step=0.5,
+            value=float(app_settings.tax.stcg_rate),
+            key="settings_tax_stcg_rate",
+        )
+    with col2:
+        ltcg_rate = st.number_input(
+            "LTCG rate (%)",
+            min_value=0.0,
+            max_value=50.0,
+            step=0.5,
+            value=float(app_settings.tax.ltcg_rate),
+            key="settings_tax_ltcg_rate",
+        )
+
+    ltcg_days = st.number_input(
+        "LTCG minimum holding period (days)",
+        min_value=0,
+        max_value=3650,
+        step=1,
+        value=int(app_settings.tax.ltcg_holding_days),
+        key="settings_tax_ltcg_days",
+    )
+
+    if st.button("💾 Save defaults", key="settings_save_button"):
+        new_settings = AppSettings(
+            fees=FeeSettings(apply=fees_apply, annual_bps=fees_bps),
+            tax=TaxSettings(
+                apply=tax_apply,
+                stcg_rate=stcg_rate,
+                ltcg_rate=ltcg_rate,
+                ltcg_holding_days=ltcg_days,
+            ),
+        )
+        save_app_settings(new_settings)
+
+        # Also push into the current wizard session so it's consistent
+        st.session_state.fees_apply = fees_apply
+        st.session_state.fees_annual_bps = fees_bps
+        st.session_state.tax_apply = tax_apply
+        st.session_state.tax_stcg_rate = stcg_rate
+        st.session_state.tax_ltcg_rate = ltcg_rate
+        st.session_state.tax_ltcg_days = ltcg_days
+
+        st.success("Defaults saved. New backtests will use these values.")
 # -------------------------------------------------------------------
 # Build BacktestConfig from session_state
 # -------------------------------------------------------------------
@@ -306,11 +493,18 @@ We'll then form portfolios from your Postgres database and compare them to a **b
 
     step = st.session_state.wizard_step
 
+    # Wizard progress
     st.sidebar.markdown("### Wizard steps")
-    st.sidebar.write(
-        f"Current step: **{step} / 6**"
-    )
+    st.sidebar.write(f"Current step: **{step} / 6**")
     st.sidebar.button("⏮ Start over", on_click=lambda: go_to_step(1))
+
+    # Extra sidebar tools
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("📚 Universe presets", expanded=False):
+        render_universe_presets_sidebar()
+
+    with st.sidebar.expander("⚙️ Fee & tax defaults", expanded=False):
+        render_settings_sidebar()
 
     # --------------------------------------------------------------
     # STEP 1 – Backtest type & time window
@@ -390,13 +584,23 @@ For now, we use a small set of **presets** that map to SQL filters inside the en
 """
         )
 
+        # Pull available presets from YAML so anything you define
+        # in the sidebar is immediately usable here.
+        presets = load_universe_presets()
+        preset_names = sorted(presets.keys()) if presets else ["equity_active_direct"]
+
+        # Keep the selected preset valid if the list changed
+        if st.session_state.universe_preset not in preset_names:
+            st.session_state.universe_preset = preset_names[0]
+
         st.selectbox(
             "Universe preset",
-            options=[
-                "equity_active_direct",
-            ],
+            options=preset_names,
             key="universe_preset",
-            help="More presets can be added over time. For now this uses the core equity active direct universe.",
+            help=(
+                "Presets are defined in app/config/universe_presets.yaml and can "
+                "be edited from the sidebar 'Universe presets' panel."
+            ),
         )
 
         st.info(

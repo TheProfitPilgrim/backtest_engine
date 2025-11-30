@@ -1,7 +1,7 @@
 import os
 import json
 
-# Function to extract the Python code from a .py or .ipynb file
+# Function to extract Python code from .py or .ipynb
 def extract_code_from_file(file_path):
     if file_path.endswith('.py'):
         with open(file_path, 'r', encoding='utf-8') as file:
@@ -22,35 +22,64 @@ def extract_code_from_file(file_path):
     return ""
 
 
-# Function to create the Markdown content
+# Function to generate a directory tree (ONLY .py and .ipynb, ignoring hidden folders)
+def generate_tree(root_dir):
+    tree_lines = []
+
+    for root, dirs, files in os.walk(root_dir):
+
+        # Remove hidden folders (anything starting with .)
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+        # Folder entry
+        level = root.replace(root_dir, "").count(os.sep)
+        indent = "    " * level
+        folder_name = os.path.basename(root) if root != root_dir else root_dir
+        tree_lines.append(f"{indent}{folder_name}/")
+
+        # Only include .py and .ipynb files (and skip hidden files)
+        sub_indent = "    " * (level + 1)
+        for f in files:
+            if not f.startswith(".") and f.endswith((".py", ".ipynb")):
+                tree_lines.append(f"{sub_indent}{f}")
+
+    return "\n".join(tree_lines)
+
+
+# Create Markdown file containing tree + extracted code
 def create_markdown_from_code(root_dir, output_md):
     with open(output_md, 'w', encoding='utf-8') as md_file:
+
+        # Write directory tree at the top
+        tree_output = generate_tree(root_dir)
+        md_file.write("# Directory Tree (Python & Notebook Files Only)\n\n")
+        md_file.write("```\n")
+        md_file.write(tree_output)
+        md_file.write("\n```\n\n")
+
+        # Extraction phase
         for root, dirs, files in os.walk(root_dir):
 
-            # Skip .venv entirely
-            if '.venv' in dirs:
-                dirs.remove('.venv')
+            # Remove hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
 
             for file in files:
-                if file.endswith(('.py', '.ipynb')):  # Include .py and .ipynb
+                if not file.startswith(".") and file.endswith((".py", ".ipynb")):
                     file_path = os.path.join(root, file)
                     code = extract_code_from_file(file_path)
 
                     if not code.strip():
-                        continue  # Skip empty results (e.g., ipynb with no code cells)
+                        continue
 
-                    # Write the title (file name) and the code to the markdown file
                     md_file.write(f"## {file}\n\n")
                     md_file.write("```python\n")
                     md_file.write(code)
                     md_file.write("\n```\n\n")
 
 
-# Define the root directory and the output markdown file
-root_directory = '.'  # Current directory (change this if needed)
-output_markdown = 'all_code.md'
-
-# Create the markdown file
+# Run
+root_directory = "."
+output_markdown = "all_code.md"
 create_markdown_from_code(root_directory, output_markdown)
 
-print(f"Markdown file '{output_markdown}' has been created with all code.")
+print(f"Markdown file '{output_markdown}' created.")
