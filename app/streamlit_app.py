@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +20,7 @@ from backtest_engine.config import (
 )
 from backtest_engine.engine import BacktestEngine
 from backtest_engine.postgres_provider import PostgresDataProvider
+from backtest_engine.db import run_sql
 
 from backtest_engine.app_settings import (
     AppSettings,
@@ -99,18 +100,15 @@ def describe_backtest(
     )
 
     # Rebalance description
-    rebalance_desc = ""
     if rebalance_freq == "NONE":
         rebalance_desc = "and then simply bought and held that portfolio without any rebalancing"
     else:
-        # Same or separate criteria?
         if not has_separate_rebalance:
             rebalance_desc = (
                 f"and then rebalanced the portfolio using the **same criteria** "
                 f"{freq_map.get(rebalance_freq, 'on a fixed schedule')}"
             )
         else:
-            # separate rebalance criteria
             if rebalance_mode == "all":
                 reb_sel_phrase = "all eligible funds at each rebalance"
             else:
@@ -157,11 +155,15 @@ def describe_backtest(
 
 
 # -------------------------------------------------------------------
-# Wizard helpers
+# Session state init
 # -------------------------------------------------------------------
+
 def init_session_state():
     if "wizard_step" not in st.session_state:
         st.session_state.wizard_step = 1
+
+    # Navigation: default to wizard
+    st.session_state.setdefault("nav_page", "Backtest wizard")
 
     # Load persisted app-level defaults (fees & tax)
     app_settings = load_app_settings()
@@ -185,9 +187,9 @@ def init_session_state():
     # Rebalance
     st.session_state.setdefault("rebalance_frequency", "12M")
     st.session_state.setdefault("use_separate_rebalance", False)
-    st.session_state.setdefault("rebalance_signal_name", "rank_12m_category")
-    st.session_state.setdefault("rebalance_signal_direction", "asc")
-    st.session_state.setdefault("rebalance_selection_mode", "top_n")
+    st.session_state.setdefault("reb_signal_name", "rank_12m_category")
+    st.session_state.setdefault("reb_signal_direction", "asc")
+    st.session_state.setdefault("reb_selection_mode", "top_n")
     st.session_state.setdefault("reb_top_n", 15)
     st.session_state.setdefault("reb_min_funds", 10)
 
@@ -204,138 +206,387 @@ def init_session_state():
     st.session_state.setdefault("tax_ltcg_rate", app_settings.tax.ltcg_rate)
     st.session_state.setdefault("tax_ltcg_days", app_settings.tax.ltcg_holding_days)
 
+
 def go_to_step(step: int):
     st.session_state.wizard_step = step
 
+
 # -------------------------------------------------------------------
-# Sidebar helpers: universe presets & app settings
+# Universe Presets Page (full-page manager)
 # -------------------------------------------------------------------
 
-def render_universe_presets_sidebar() -> None:
-    """Small CRUD UI for universe presets stored in universe_presets.yaml."""
+@st.cache_data(show_spinner=False)
+def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]], str | None]:
+    """
+    Pull distinct asset_type + category from sclass_mst.
+
+    Returns:
+        asset_types, categories, categories_by_asset_type, error_message
+    """
+    try:
+        df = run_sql(
+            """
+            SELECT DISTINCT asset_type, category
+            FROM sclass_mst
+            ORDER BY asset_type, category;
+            """
+        )
+    except Exception as e:
+        return [], [], {}, f"{e}"
+
+    if df.empty:
+        return [], [], {}, "No rows returned from sclass_mst."
+
+    df["asset_type"] = df["asset_type"].fillna("Unknown")
+    df["category"] = df["category"].fillna("Unknown")
+
+    asset_types = sorted(df["asset_type"].unique().tolist())
+    categories = sorted(df["category"].unique().tolist())
+    cats_by_asset: Dict[str, List[str]] = {}
+    for atype in asset_types:
+        cats = (
+            df.loc[df["asset_type"] == atype, "category"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        cats_by_asset[atype] = sorted(cats)
+
+    return asset_types, categories, cats_by_asset, None
+
+
+def universe_presets_page() -> None:
+    st.title("📚 Universe presets")
+
+    st.markdown(
+        """
+Define **named universes** that control which mutual funds are even eligible for selection.
+
+Each preset stores:
+- A label + description (for humans).
+- Filters like:
+  - **Asset types** (e.g. Equity, Hybrid, Debt).
+  - **Include / exclude categories** (backed by `sclass_mst`).
+  - Flags such as:
+    - Only direct plans
+    - Only active funds (exclude pure index/ETFs)
+    - Investible today only
+    - Growth option only
+"""
+    )
+
     presets = load_universe_presets()
     if not presets:
-        # This will also seed the default preset
+        # Seed default equity_active_direct if file missing/empty
         presets = load_universe_presets()
 
     preset_names = sorted(presets.keys())
-    selected_name = st.selectbox(
-        "Edit preset",
-        options=preset_names,
-        key="sidebar_universe_preset_editor",
+
+    asset_types_all, categories_all, cats_by_asset, taxonomy_error = load_category_taxonomy()
+
+    if taxonomy_error:
+        st.warning(
+            "Could not load `asset_type` / `category` list from DB. "
+            "You can still edit presets, but category options are not validated.\n\n"
+            f"Raw error: `{taxonomy_error}`"
+        )
+
+    st.markdown("### Pick or create a preset")
+
+    col_left, col_right = st.columns([1, 3])
+
+    with col_left:
+        options = ["<New preset>"] + preset_names
+        choice = st.selectbox(
+            "Preset",
+            options=options,
+            key="uni_choice",
+            help="Choose an existing preset to edit, or '<New preset>' to create one.",
+        )
+
+        st.markdown("#### Existing presets")
+        if preset_names:
+            preview_rows = []
+            for name in preset_names:
+                p = presets.get(name, {})
+                preview_rows.append(
+                    {
+                        "key": name,
+                        "label": p.get("label", name.replace("_", " ").title()),
+                        "asset_types": ", ".join(p.get("asset_types", [])) or "—",
+                        "include_categories": ", ".join(p.get("include_categories", [])) or "—",
+                        "exclude_categories": ", ".join(p.get("exclude_categories", [])) or "—",
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(preview_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No presets yet. Saving your first preset will create the YAML file.")
+
+    with col_right:
+        st.markdown("### Edit preset")
+
+        if choice == "<New preset>":
+            original_name = None
+            working = {
+                "label": "",
+                "description": "",
+                "asset_types": ["Equity"] if "Equity" in asset_types_all else [],
+                "include_categories": [],
+                "exclude_categories": [],
+                "only_direct": True,
+                "only_active": True,
+                "investible_only": True,
+                "growth_only": True,
+            }
+        else:
+            original_name = choice
+            working = presets[choice].copy()
+
+        internal_name = st.text_input(
+            "Preset key (internal)",
+            value=original_name or "",
+            help="Short identifier like 'equity_active_direct'. Used in configs & backtests.",
+            key="uni_internal_name",
+        )
+
+        label = st.text_input(
+            "Label (for UI display)",
+            value=working.get("label", internal_name.replace("_", " ").title() if internal_name else ""),
+            key="uni_label",
+        )
+
+        desc = st.text_area(
+            "Description",
+            value=working.get("description", ""),
+            key="uni_desc",
+        )
+
+        # --- Filters driven by DB taxonomy ----------------------------------
+        st.subheader("Filters")
+
+        # Asset types
+        existing_asset_types = working.get("asset_types", []) or []
+        asset_options = sorted(set(asset_types_all) | set(existing_asset_types))
+
+        if not asset_options:
+            asset_options = existing_asset_types  # fallback if DB failed
+
+        default_assets = existing_asset_types
+        if not default_assets and "Equity" in asset_options:
+            default_assets = ["Equity"]
+        elif not default_assets:
+            default_assets = asset_options
+
+        selected_asset_types = st.multiselect(
+            "Asset types",
+            options=asset_options,
+            default=default_assets,
+            help="Leave empty to cover all asset types in the DB.",
+            key="uni_asset_types",
+        )
+
+        # Categories (global include/exclude lists)
+        existing_inc = working.get("include_categories", []) or []
+        existing_exc = working.get("exclude_categories", []) or []
+
+        cat_options = sorted(
+            set(categories_all) | set(existing_inc) | set(existing_exc)
+        )
+
+        include_categories = st.multiselect(
+            "Include categories (optional)",
+            options=cat_options,
+            default=existing_inc,
+            help="If left empty, all categories under the chosen asset types are allowed.",
+            key="uni_include_categories",
+        )
+
+        exclude_categories = st.multiselect(
+            "Exclude categories",
+            options=cat_options,
+            default=existing_exc,
+            help="Categories to *drop* from the universe (e.g. Sectoral / Thematic, ELSS, Solution Oriented, Liquid, Overnight).",
+            key="uni_exclude_categories",
+        )
+
+        # Flags
+        col_flags1, col_flags2 = st.columns(2)
+        with col_flags1:
+            only_direct = st.checkbox(
+                "Only direct plans",
+                value=working.get("only_direct", True),
+                key="uni_only_direct",
+            )
+            only_active = st.checkbox(
+                "Only active funds (exclude pure index/ETF)",
+                value=working.get("only_active", True),
+                key="uni_only_active",
+            )
+        with col_flags2:
+            investible_only = st.checkbox(
+                "Investible today only",
+                value=working.get("investible_only", True),
+                key="uni_investible_only",
+            )
+            growth_only = st.checkbox(
+                "Growth option only (dividendoptionflag = 'Z')",
+                value=working.get("growth_only", True),
+                key="uni_growth_only",
+            )
+
+        # Preview DB taxonomy if available
+        if asset_types_all and cats_by_asset:
+            with st.expander("🔎 DB taxonomy: asset types & categories", expanded=False):
+                rows = []
+                for atype, cats in cats_by_asset.items():
+                    for cat in cats:
+                        rows.append({"asset_type": atype, "category": cat})
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.markdown("### Actions")
+
+        col_save, col_delete = st.columns([2, 1])
+
+        with col_save:
+            if st.button("💾 Save preset", key="uni_save_button"):
+                name = internal_name.strip()
+                if not name:
+                    st.error("Preset key cannot be empty.")
+                else:
+                    if original_name and name != original_name and name in presets:
+                        st.error(f"Preset key '{name}' already exists.")
+                    else:
+                        payload = {
+                            "label": label.strip() or name.replace("_", " ").title(),
+                            "description": desc.strip(),
+                            "asset_types": selected_asset_types,
+                            "include_categories": include_categories,
+                            "exclude_categories": exclude_categories,
+                            "only_direct": bool(only_direct),
+                            "only_active": bool(only_active),
+                            "investible_only": bool(investible_only),
+                            "growth_only": bool(growth_only),
+                        }
+
+                        # Apply rename if needed
+                        if original_name and name != original_name:
+                            presets.pop(original_name, None)
+
+                        presets[name] = payload
+                        save_universe_presets(presets)
+                        st.session_state.universe_preset = name
+                        st.success(f"Preset '{name}' saved.")
+                        st.session_state.uni_choice = name  # keep selection in UI
+
+        with col_delete:
+            can_delete = original_name is not None
+            if st.button(
+                "🗑 Delete preset",
+                key="uni_delete_button",
+                disabled=not can_delete,
+                help="You cannot delete while creating a brand new preset.",
+            ):
+                if original_name is not None:
+                    presets.pop(original_name, None)
+                    save_universe_presets(presets)
+                    st.success(f"Preset '{original_name}' deleted.")
+                    st.session_state.uni_choice = "<New preset>"
+
+        st.markdown("---")
+        st.markdown("#### Effective filter summary (for sanity check)")
+
+        summary_lines = [
+            f"- **Key**: `{internal_name or '—'}`",
+            f"- **Label**: {label or '—'}",
+            f"- **Asset types**: {', '.join(selected_asset_types) if selected_asset_types else 'All asset types'}",
+        ]
+        if include_categories:
+            summary_lines.append(
+                f"- **Include categories**: {', '.join(include_categories)}"
+            )
+        else:
+            summary_lines.append("- **Include categories**: All categories under the asset types above")
+
+        if exclude_categories:
+            summary_lines.append(
+                f"- **Exclude categories**: {', '.join(exclude_categories)}"
+            )
+
+        flags_text = []
+        if only_direct:
+            flags_text.append("Direct plans only")
+        if only_active:
+            flags_text.append("Active funds only")
+        if investible_only:
+            flags_text.append("Investible today only")
+        if growth_only:
+            flags_text.append("Growth option only")
+
+        summary_lines.append(
+            "- **Flags**: " + (", ".join(flags_text) if flags_text else "None")
+        )
+
+        st.markdown("\n".join(summary_lines))
+
+
+# -------------------------------------------------------------------
+# App Settings Page (fees & tax defaults)
+# -------------------------------------------------------------------
+
+def app_settings_page() -> None:
+    st.title("⚙️ App settings – fee & tax defaults")
+
+    st.markdown(
+        """
+These settings control the **default values** that the wizard uses on
+**Step 5 – Costs & taxes**.
+
+You can override them per-run inside the wizard; this page just sets
+the *starting defaults* for new sessions.
+"""
     )
 
-    preset = presets[selected_name]
-
-    st.caption("Adjust the filters below and save as the same or a new name.")
-    desc = st.text_input(
-        "Description",
-        value=preset.get("description", ""),
-        key="sidebar_universe_desc",
-    )
-    asset_types_str = st.text_input(
-        "Asset types (comma-separated)",
-        value=", ".join(preset.get("asset_types", [])),
-        key="sidebar_universe_asset_types",
-    )
-    include_cats_str = st.text_input(
-        "Include categories (comma-separated; empty = all)",
-        value=", ".join(preset.get("include_categories", [])),
-        key="sidebar_universe_include_cats",
-    )
-    exclude_cats_str = st.text_input(
-        "Exclude categories (comma-separated)",
-        value=", ".join(preset.get("exclude_categories", [])),
-        key="sidebar_universe_exclude_cats",
-    )
-
-    only_direct = st.checkbox(
-        "Only direct plans",
-        value=preset.get("only_direct", True),
-        key="sidebar_universe_only_direct",
-    )
-    only_active = st.checkbox(
-        "Only active (exclude index/ETF)",
-        value=preset.get("only_active", True),
-        key="sidebar_universe_only_active",
-    )
-    investible_only = st.checkbox(
-        "Investible today only",
-        value=preset.get("investible_only", True),
-        key="sidebar_universe_investible_only",
-    )
-    growth_only = st.checkbox(
-        "Growth option only",
-        value=preset.get("growth_only", True),
-        key="sidebar_universe_growth_only",
-    )
-
-    new_name = st.text_input(
-        "Save as preset name",
-        value=selected_name,
-        key="sidebar_universe_new_name",
-        help="Change this to create a new preset based on the current one.",
-    )
-
-    col_save, col_delete = st.columns(2)
-    with col_save:
-        if st.button("💾 Save preset", key="sidebar_universe_save"):
-            name = new_name.strip()
-            if not name:
-                st.error("Preset name cannot be empty.")
-            else:
-                presets[name] = {
-                    "description": desc.strip(),
-                    "asset_types": [s.strip() for s in asset_types_str.split(",") if s.strip()],
-                    "include_categories": [s.strip() for s in include_cats_str.split(",") if s.strip()],
-                    "exclude_categories": [s.strip() for s in exclude_cats_str.split(",") if s.strip()],
-                    "only_direct": only_direct,
-                    "only_active": only_active,
-                    "investible_only": investible_only,
-                    "growth_only": growth_only,
-                }
-                save_universe_presets(presets)
-                st.session_state.universe_preset = name
-                st.success(f"Preset '{name}' saved.")
-
-    with col_delete:
-        if (
-            selected_name != "equity_active_direct"
-            and st.button("🗑 Delete", key="sidebar_universe_delete")
-        ):
-            presets.pop(selected_name, None)
-            save_universe_presets(presets)
-            st.success(f"Preset '{selected_name}' deleted.")
-
-
-def render_settings_sidebar() -> None:
-    """Edit app-level fee & tax defaults and persist them."""
     app_settings = load_app_settings()
 
-    st.caption("Defaults used to seed the wizard's Step 5 fields.")
-
-    fees_apply = st.checkbox(
-        "Apply fees by default",
-        value=app_settings.fees.apply,
-        key="settings_fees_apply",
-    )
-    fees_bps = st.number_input(
-        "Annual fee (bps)",
-        min_value=0.0,
-        max_value=1000.0,
-        step=5.0,
-        value=float(app_settings.fees.annual_bps),
-        key="settings_fees_annual_bps",
-    )
-
-    tax_apply = st.checkbox(
-        "Apply tax by default",
-        value=app_settings.tax.apply,
-        key="settings_tax_apply",
-    )
+    st.subheader("Fees (default)")
 
     col1, col2 = st.columns(2)
     with col1:
+        fees_apply = st.checkbox(
+            "Apply fees by default?",
+            value=app_settings.fees.apply,
+            key="settings_fees_apply",
+        )
+    with col2:
+        fees_bps = st.number_input(
+            "Annual fee (bps)",
+            min_value=0.0,
+            max_value=1000.0,
+            step=5.0,
+            value=float(app_settings.fees.annual_bps),
+            key="settings_fees_annual_bps",
+            help="100 bps = 1.00% p.a.",
+        )
+
+    st.subheader("Tax (default)")
+
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        tax_apply = st.checkbox(
+            "Capture capital gains tax by default?",
+            value=app_settings.tax.apply,
+            key="settings_tax_apply",
+            help="Tax is currently not applied in the engine yet; only stored in config.",
+        )
+    with col4:
         stcg_rate = st.number_input(
             "STCG rate (%)",
             min_value=0.0,
@@ -344,7 +595,7 @@ def render_settings_sidebar() -> None:
             value=float(app_settings.tax.stcg_rate),
             key="settings_tax_stcg_rate",
         )
-    with col2:
+    with col5:
         ltcg_rate = st.number_input(
             "LTCG rate (%)",
             min_value=0.0,
@@ -384,6 +635,8 @@ def render_settings_sidebar() -> None:
         st.session_state.tax_ltcg_days = ltcg_days
 
         st.success("Defaults saved. New backtests will use these values.")
+
+
 # -------------------------------------------------------------------
 # Build BacktestConfig from session_state
 # -------------------------------------------------------------------
@@ -481,6 +734,23 @@ def main():
 
     init_session_state()
 
+    # Sidebar navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        options=["Backtest wizard", "Universe presets", "App settings"],
+        key="nav_page",
+    )
+
+    # Route to dedicated pages first
+    if page == "Universe presets":
+        universe_presets_page()
+        return
+    elif page == "App settings":
+        app_settings_page()
+        return
+
+    # From here on, we're in the Backtest wizard
     st.title("📈 Mutual Fund Backtest Wizard")
     st.markdown(
         """
@@ -497,14 +767,6 @@ We'll then form portfolios from your Postgres database and compare them to a **b
     st.sidebar.markdown("### Wizard steps")
     st.sidebar.write(f"Current step: **{step} / 6**")
     st.sidebar.button("⏮ Start over", on_click=lambda: go_to_step(1))
-
-    # Extra sidebar tools
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("📚 Universe presets", expanded=False):
-        render_universe_presets_sidebar()
-
-    with st.sidebar.expander("⚙️ Fee & tax defaults", expanded=False):
-        render_settings_sidebar()
 
     # --------------------------------------------------------------
     # STEP 1 – Backtest type & time window
@@ -523,7 +785,7 @@ Here you decide **how many portfolios** we simulate and **over what calendar win
 
         col1, col2 = st.columns(2)
         with col1:
-            mode_label = st.radio(
+            st.radio(
                 "Backtest mode",
                 options=["single", "rolling_cohort"],
                 format_func=lambda x: "Single backtest" if x == "single" else "Rolling cohorts",
@@ -579,13 +841,15 @@ Here you decide **how many portfolios** we simulate and **over what calendar win
             """
 The **universe** defines **which mutual funds are even eligible** for selection.
 
-For now, we use a small set of **presets** that map to SQL filters inside the engine.  
+We use **presets** that map to SQL filters inside the engine.  
 (For example, `equity_active_direct` = active equity schemes, direct plans, investible today, excluding thematic/sector, etc.)
+
+You can define and edit presets on the **Universe presets** page in the sidebar.
 """
         )
 
         # Pull available presets from YAML so anything you define
-        # in the sidebar is immediately usable here.
+        # on the Universe presets page is immediately usable here.
         presets = load_universe_presets()
         preset_names = sorted(presets.keys()) if presets else ["equity_active_direct"]
 
@@ -599,7 +863,7 @@ For now, we use a small set of **presets** that map to SQL filters inside the en
             key="universe_preset",
             help=(
                 "Presets are defined in app/config/universe_presets.yaml and can "
-                "be edited from the sidebar 'Universe presets' panel."
+                "be edited from the 'Universe presets' page."
             ),
         )
 
