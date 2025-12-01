@@ -254,7 +254,6 @@ def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]]
 
     return asset_types, categories, cats_by_asset, None
 
-
 def universe_presets_page() -> None:
     st.title("📚 Universe presets")
 
@@ -263,25 +262,27 @@ def universe_presets_page() -> None:
 Define **named universes** that control which mutual funds are even eligible for selection.
 
 Each preset stores:
+
 - A label + description (for humans).
 - Filters like:
   - **Asset types** (e.g. Equity, Hybrid, Debt).
   - **Include / exclude categories** (backed by `sclass_mst`).
-  - Flags such as:
-    - Only direct plans
-    - Only active funds (exclude pure index/ETFs)
-    - Investible today only
-    - Growth option only
+- Flags such as:
+  - Only direct plans
+  - Only active funds (exclude pure index/ETFs)
+  - Investible today only
+  - Growth option only
 """
     )
 
+    # Load presets from YAML (and seed defaults if needed)
     presets = load_universe_presets()
     if not presets:
-        # Seed default equity_active_direct if file missing/empty
         presets = load_universe_presets()
 
     preset_names = sorted(presets.keys())
 
+    # Load DB taxonomy for asset_type / category
     asset_types_all, categories_all, cats_by_asset, taxonomy_error = load_category_taxonomy()
 
     if taxonomy_error:
@@ -291,43 +292,70 @@ Each preset stores:
             f"Raw error: `{taxonomy_error}`"
         )
 
-    st.markdown("### Pick or create a preset")
+    tab_list, tab_edit = st.tabs(["📋 Preset list", "✏️ Create / edit preset"])
 
-    col_left, col_right = st.columns([1, 3])
+    # ------------------------------------------------------------------
+    # TAB 1 – List all presets in a neat table
+    # ------------------------------------------------------------------
+    with tab_list:
+        st.subheader("Existing presets")
 
-    with col_left:
-        options = ["<New preset>"] + preset_names
-        choice = st.selectbox(
-            "Preset",
-            options=options,
-            key="uni_choice",
-            help="Choose an existing preset to edit, or '<New preset>' to create one.",
-        )
-
-        st.markdown("#### Existing presets")
-        if preset_names:
-            preview_rows = []
+        if not preset_names:
+            st.info("No presets yet. Switch to the **Create / edit preset** tab to add one.")
+        else:
+            rows = []
             for name in preset_names:
                 p = presets.get(name, {})
-                preview_rows.append(
+                rows.append(
                     {
                         "key": name,
                         "label": p.get("label", name.replace("_", " ").title()),
                         "asset_types": ", ".join(p.get("asset_types", [])) or "—",
                         "include_categories": ", ".join(p.get("include_categories", [])) or "—",
                         "exclude_categories": ", ".join(p.get("exclude_categories", [])) or "—",
+                        "flags": ", ".join(
+                            [
+                                text
+                                for flag, text in [
+                                    (p.get("only_direct", False), "direct-only"),
+                                    (p.get("only_active", False), "active-only"),
+                                    (p.get("investible_only", False), "investible-only"),
+                                    (p.get("growth_only", False), "growth-only"),
+                                ]
+                                if flag
+                            ]
+                        )
+                        or "—",
                     }
                 )
+
             st.dataframe(
-                pd.DataFrame(preview_rows),
+                pd.DataFrame(rows),
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
-            st.info("No presets yet. Saving your first preset will create the YAML file.")
 
-    with col_right:
-        st.markdown("### Edit preset")
+            st.caption(
+                "To modify any preset, switch to the **Create / edit preset** tab and select it there."
+            )
+
+    # ------------------------------------------------------------------
+    # TAB 2 – Create / edit presets (clean form layout)
+    # ------------------------------------------------------------------
+    with tab_edit:
+        st.subheader("Pick or create a preset")
+
+        # If any button set a "pending" choice last run, apply it
+        if "uni_choice_pending" in st.session_state:
+            st.session_state["uni_choice"] = st.session_state.pop("uni_choice_pending")
+
+        options = ["<New preset>"] + preset_names
+        choice = st.selectbox(
+            "Preset to edit",
+            options=options,
+            key="uni_choice",
+            help="Choose an existing preset to edit, or '<New preset>' to start from a blank template.",
+        )
 
         if choice == "<New preset>":
             original_name = None
@@ -346,18 +374,25 @@ Each preset stores:
             original_name = choice
             working = presets[choice].copy()
 
-        internal_name = st.text_input(
-            "Preset key (internal)",
-            value=original_name or "",
-            help="Short identifier like 'equity_active_direct'. Used in configs & backtests.",
-            key="uni_internal_name",
-        )
+        st.markdown("### Basic info")
 
-        label = st.text_input(
-            "Label (for UI display)",
-            value=working.get("label", internal_name.replace("_", " ").title() if internal_name else ""),
-            key="uni_label",
-        )
+        col_basic_1, col_basic_2 = st.columns(2)
+        with col_basic_1:
+            internal_name = st.text_input(
+                "Preset key (internal)",
+                value=original_name or "",
+                key="uni_internal_name",
+                help="Short identifier like 'equity_active_direct'. Used in configs & backtests.",
+            )
+        with col_basic_2:
+            label = st.text_input(
+                "Label (for UI display)",
+                value=working.get(
+                    "label",
+                    internal_name.replace("_", " ").title() if internal_name else "",
+                ),
+                key="uni_label",
+            )
 
         desc = st.text_area(
             "Description",
@@ -365,57 +400,63 @@ Each preset stores:
             key="uni_desc",
         )
 
-        # --- Filters driven by DB taxonomy ----------------------------------
-        st.subheader("Filters")
+        st.markdown("### Filters")
 
-        # Asset types
-        existing_asset_types = working.get("asset_types", []) or []
-        asset_options = sorted(set(asset_types_all) | set(existing_asset_types))
+        # --- Asset types & categories side by side ----------------------
+        col_filters_left, col_filters_right = st.columns(2)
 
-        if not asset_options:
-            asset_options = existing_asset_types  # fallback if DB failed
+        with col_filters_left:
+            # Asset types
+            existing_asset_types = working.get("asset_types", []) or []
+            asset_options = sorted(set(asset_types_all) | set(existing_asset_types))
 
-        default_assets = existing_asset_types
-        if not default_assets and "Equity" in asset_options:
-            default_assets = ["Equity"]
-        elif not default_assets:
-            default_assets = asset_options
+            if not asset_options:
+                asset_options = existing_asset_types  # fallback
 
-        selected_asset_types = st.multiselect(
-            "Asset types",
-            options=asset_options,
-            default=default_assets,
-            help="Leave empty to cover all asset types in the DB.",
-            key="uni_asset_types",
-        )
+            default_assets = existing_asset_types
+            if not default_assets and "Equity" in asset_options:
+                default_assets = ["Equity"]
+            elif not default_assets:
+                default_assets = asset_options
 
-        # Categories (global include/exclude lists)
-        existing_inc = working.get("include_categories", []) or []
-        existing_exc = working.get("exclude_categories", []) or []
+            selected_asset_types = st.multiselect(
+                "Asset types",
+                options=asset_options,
+                default=default_assets,
+                help="Leave empty to cover all asset types in the DB.",
+                key="uni_asset_types",
+            )
 
-        cat_options = sorted(
-            set(categories_all) | set(existing_inc) | set(existing_exc)
-        )
+            # Include categories
+            existing_inc = working.get("include_categories", []) or []
+            cat_options = sorted(
+                set(categories_all) | set(existing_inc) | set(working.get("exclude_categories", []))
+            )
 
-        include_categories = st.multiselect(
-            "Include categories (optional)",
-            options=cat_options,
-            default=existing_inc,
-            help="If left empty, all categories under the chosen asset types are allowed.",
-            key="uni_include_categories",
-        )
+            include_categories = st.multiselect(
+                "Include categories (optional)",
+                options=cat_options,
+                default=existing_inc,
+                help="If left empty, all categories under the chosen asset types are allowed.",
+                key="uni_include_categories",
+            )
 
-        exclude_categories = st.multiselect(
-            "Exclude categories",
-            options=cat_options,
-            default=existing_exc,
-            help="Categories to *drop* from the universe (e.g. Sectoral / Thematic, ELSS, Solution Oriented, Liquid, Overnight).",
-            key="uni_exclude_categories",
-        )
+        with col_filters_right:
+            # Exclude categories
+            existing_exc = working.get("exclude_categories", []) or []
+            cat_options = sorted(
+                set(categories_all) | set(existing_exc) | set(working.get("include_categories", []))
+            )
 
-        # Flags
-        col_flags1, col_flags2 = st.columns(2)
-        with col_flags1:
+            exclude_categories = st.multiselect(
+                "Exclude categories",
+                options=cat_options,
+                default=existing_exc,
+                help="Categories to *drop* from the universe (e.g. Sectoral / Thematic, ELSS, Solution Oriented, Liquid, Overnight).",
+                key="uni_exclude_categories",
+            )
+
+            st.markdown("#### Flags")
             only_direct = st.checkbox(
                 "Only direct plans",
                 value=working.get("only_direct", True),
@@ -426,7 +467,6 @@ Each preset stores:
                 value=working.get("only_active", True),
                 key="uni_only_active",
             )
-        with col_flags2:
             investible_only = st.checkbox(
                 "Investible today only",
                 value=working.get("investible_only", True),
@@ -438,7 +478,7 @@ Each preset stores:
                 key="uni_growth_only",
             )
 
-        # Preview DB taxonomy if available
+        # Optional DB taxonomy preview
         if asset_types_all and cats_by_asset:
             with st.expander("🔎 DB taxonomy: asset types & categories", expanded=False):
                 rows = []
@@ -476,15 +516,16 @@ Each preset stores:
                             "growth_only": bool(growth_only),
                         }
 
-                        # Apply rename if needed
+                        # Handle rename
                         if original_name and name != original_name:
                             presets.pop(original_name, None)
 
                         presets[name] = payload
                         save_universe_presets(presets)
+
                         st.session_state.universe_preset = name
+                        st.session_state["uni_choice_pending"] = name
                         st.success(f"Preset '{name}' saved.")
-                        st.session_state.uni_choice = name  # keep selection in UI
 
         with col_delete:
             can_delete = original_name is not None
@@ -497,11 +538,11 @@ Each preset stores:
                 if original_name is not None:
                     presets.pop(original_name, None)
                     save_universe_presets(presets)
+                    st.session_state["uni_choice_pending"] = "<New preset>"
                     st.success(f"Preset '{original_name}' deleted.")
-                    st.session_state.uni_choice = "<New preset>"
 
         st.markdown("---")
-        st.markdown("#### Effective filter summary (for sanity check)")
+        st.markdown("### Effective filter summary")
 
         summary_lines = [
             f"- **Key**: `{internal_name or '—'}`",
@@ -513,7 +554,9 @@ Each preset stores:
                 f"- **Include categories**: {', '.join(include_categories)}"
             )
         else:
-            summary_lines.append("- **Include categories**: All categories under the asset types above")
+            summary_lines.append(
+                "- **Include categories**: All categories under the asset types above"
+            )
 
         if exclude_categories:
             summary_lines.append(
@@ -535,8 +578,6 @@ Each preset stores:
         )
 
         st.markdown("\n".join(summary_lines))
-
-
 # -------------------------------------------------------------------
 # App Settings Page (fees & tax defaults)
 # -------------------------------------------------------------------
