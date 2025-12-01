@@ -23,12 +23,7 @@ from backtest_engine.postgres_provider import PostgresDataProvider
 from backtest_engine.db import run_sql
 
 from backtest_engine.app_settings import (
-    AppSettings,
-    FeeSettings,
-    TaxSettings,
-    load_app_settings,
     load_universe_presets,
-    save_app_settings,
     save_universe_presets,
 )
 
@@ -157,7 +152,6 @@ def describe_backtest(
 # -------------------------------------------------------------------
 # Session state init
 # -------------------------------------------------------------------
-
 def init_session_state():
     if "wizard_step" not in st.session_state:
         st.session_state.wizard_step = 1
@@ -165,10 +159,7 @@ def init_session_state():
     # Navigation: default to wizard
     st.session_state.setdefault("nav_page", "Backtest wizard")
 
-    # Load persisted app-level defaults (fees & tax)
-    app_settings = load_app_settings()
-
-    # Basic fields defaults
+    # --- Basic backtest defaults ---------------------------------------
     st.session_state.setdefault("run_name", "mf-10y-annual-top15")
     st.session_state.setdefault("mode", "single")
     st.session_state.setdefault("study_start", date(2014, 1, 1))
@@ -197,15 +188,20 @@ def init_session_state():
     st.session_state.setdefault("cohort_start_frequency", "1M")
     st.session_state.setdefault("cohort_horizon_years", 3.0)
 
-    # Fees & tax – seed from app-level defaults defined in app_settings.yaml
-    st.session_state.setdefault("fees_apply", app_settings.fees.apply)
-    st.session_state.setdefault("fees_annual_bps", app_settings.fees.annual_bps)
+    # --- Fees & taxes: HARD-CODED wizard defaults ----------------------
+    # Your requested defaults:
+    #   fee      = 100 bps (1.00% p.a.)
+    #   STCG     = 20%
+    #   LTCG     = 12.5%
+    #   LTCG min = 365 days
 
-    st.session_state.setdefault("tax_apply", app_settings.tax.apply)
-    st.session_state.setdefault("tax_stcg_rate", app_settings.tax.stcg_rate)
-    st.session_state.setdefault("tax_ltcg_rate", app_settings.tax.ltcg_rate)
-    st.session_state.setdefault("tax_ltcg_days", app_settings.tax.ltcg_holding_days)
+    st.session_state.setdefault("fees_apply", True)
+    st.session_state.setdefault("fees_annual_bps", 100.0)
 
+    st.session_state.setdefault("tax_apply", True)
+    st.session_state.setdefault("tax_stcg_rate", 20.0)
+    st.session_state.setdefault("tax_ltcg_rate", 12.5)
+    st.session_state.setdefault("tax_ltcg_days", 365)
 
 def go_to_step(step: int):
     st.session_state.wizard_step = step
@@ -595,89 +591,6 @@ the *starting defaults* for new sessions.
 """
     )
 
-    app_settings = load_app_settings()
-
-    st.subheader("Fees (default)")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fees_apply = st.checkbox(
-            "Apply fees by default?",
-            value=app_settings.fees.apply,
-            key="settings_fees_apply",
-        )
-    with col2:
-        fees_bps = st.number_input(
-            "Annual fee (bps)",
-            min_value=0.0,
-            max_value=1000.0,
-            step=5.0,
-            value=float(app_settings.fees.annual_bps),
-            key="settings_fees_annual_bps",
-            help="100 bps = 1.00% p.a.",
-        )
-
-    st.subheader("Tax (default)")
-
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        tax_apply = st.checkbox(
-            "Capture capital gains tax by default?",
-            value=app_settings.tax.apply,
-            key="settings_tax_apply",
-            help="Tax is currently not applied in the engine yet; only stored in config.",
-        )
-    with col4:
-        stcg_rate = st.number_input(
-            "STCG rate (%)",
-            min_value=0.0,
-            max_value=50.0,
-            step=0.5,
-            value=float(app_settings.tax.stcg_rate),
-            key="settings_tax_stcg_rate",
-        )
-    with col5:
-        ltcg_rate = st.number_input(
-            "LTCG rate (%)",
-            min_value=0.0,
-            max_value=50.0,
-            step=0.5,
-            value=float(app_settings.tax.ltcg_rate),
-            key="settings_tax_ltcg_rate",
-        )
-
-    ltcg_days = st.number_input(
-        "LTCG minimum holding period (days)",
-        min_value=0,
-        max_value=3650,
-        step=1,
-        value=int(app_settings.tax.ltcg_holding_days),
-        key="settings_tax_ltcg_days",
-    )
-
-    if st.button("💾 Save defaults", key="settings_save_button"):
-        new_settings = AppSettings(
-            fees=FeeSettings(apply=fees_apply, annual_bps=fees_bps),
-            tax=TaxSettings(
-                apply=tax_apply,
-                stcg_rate=stcg_rate,
-                ltcg_rate=ltcg_rate,
-                ltcg_holding_days=ltcg_days,
-            ),
-        )
-        save_app_settings(new_settings)
-
-        # Also push into the current wizard session so it's consistent
-        st.session_state.fees_apply = fees_apply
-        st.session_state.fees_annual_bps = fees_bps
-        st.session_state.tax_apply = tax_apply
-        st.session_state.tax_stcg_rate = stcg_rate
-        st.session_state.tax_ltcg_rate = ltcg_rate
-        st.session_state.tax_ltcg_days = ltcg_days
-
-        st.success("Defaults saved. New backtests will use these values.")
-
-
 # -------------------------------------------------------------------
 # Build BacktestConfig from session_state
 # -------------------------------------------------------------------
@@ -779,16 +692,13 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        options=["Backtest wizard", "Universe presets", "App settings"],
+        options=["Backtest wizard", "Universe presets"],
         key="nav_page",
     )
 
     # Route to dedicated pages first
     if page == "Universe presets":
         universe_presets_page()
-        return
-    elif page == "App settings":
-        app_settings_page()
         return
 
     # From here on, we're in the Backtest wizard
