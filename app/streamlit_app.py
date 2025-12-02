@@ -20,7 +20,9 @@ from backtest_engine.config import (
 )
 from backtest_engine.engine import BacktestEngine
 from backtest_engine.postgres_provider import PostgresDataProvider
-from backtest_engine.db import run_sql
+
+from backtest_engine.db import run_sql, get_engine
+from backtest_engine.formula import load_selection_field_registry
 
 from backtest_engine.app_settings import (
     load_universe_presets,
@@ -173,6 +175,11 @@ def init_session_state():
     st.session_state.setdefault("entry_selection_mode", "top_n")
     st.session_state.setdefault("entry_top_n", 15)
     st.session_state.setdefault("entry_min_funds", 10)
+    # Signal definition mode + formula bits
+    st.session_state.setdefault("entry_signal_mode", "simple")  # "simple" or "formula"
+    st.session_state.setdefault("entry_signal_expression", "")
+    st.session_state.setdefault("entry_signal_filter_expression", "")
+    st.session_state.setdefault("entry_signal_field_search", "")
 
     # Rebalance
     st.session_state.setdefault("rebalance_frequency", "12M")
@@ -209,6 +216,22 @@ def go_to_step(step: int):
 # -------------------------------------------------------------------
 # Universe Presets Page (full-page manager)
 # -------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_signal_field_registry():
+    """
+    Cached wrapper over load_selection_field_registry for the Step 3 UI.
+
+    Returns (registry, error_msg). 'registry' maps column_name -> FieldInfo,
+    and FieldInfo.table tells you which table it came from.
+    """
+    try:
+        engine = get_engine()
+        registry = load_selection_field_registry(engine)
+    except Exception as e:
+        return {}, str(e)
+
+    return registry, None
 
 @st.cache_data(show_spinner=False)
 def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]], str | None]:
@@ -248,6 +271,20 @@ def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]]
         cats_by_asset[atype] = sorted(cats)
 
     return asset_types, categories, cats_by_asset, None
+
+@st.cache_data(show_spinner=False)
+def load_signal_fields() -> tuple[list[str], str | None]:
+    """
+    Load the list of allowed fields from performance_ranking
+    that can be used in Step 3 formulas.
+    """
+    try:
+        engine = get_engine()
+        registry = load_selection_field_registry(engine)
+    except Exception as e:
+        return [], str(e)
+
+    return sorted(registry.keys()), None
 
 def universe_presets_page() -> None:
     st.title("📚 Universe presets")
@@ -603,9 +640,26 @@ def build_config_from_state() -> BacktestConfig:
     study_window = StudyWindow(start=start_date, end=end_date)
     universe = UniverseConfig(preset=st.session_state.universe_preset)
 
+    # Entry signal: simple vs formula mode
+    entry_signal_mode = st.session_state.get("entry_signal_mode", "simple")
+    expr = st.session_state.get("entry_signal_expression", "").strip()
+    filt_expr = st.session_state.get("entry_signal_filter_expression", "").strip()
+
+    # Only keep expressions if we're in formula mode and something is actually entered
+    if entry_signal_mode != "formula":
+        expr = None
+        filt_expr = None
+    else:
+        if not expr:
+            expr = None
+        if not filt_expr:
+            filt_expr = None
+
     entry_signal = SignalConfig(
         name=st.session_state.entry_signal_name,
         direction=st.session_state.entry_signal_direction,
+        expression=expr,
+        filter_expression=filt_expr,
     )
 
     entry_selection = SelectionConfig(
@@ -839,27 +893,185 @@ You can define and edit presets on the **Universe presets** page in the sidebar.
 Here you tell the engine **how to score and pick funds at the start of the portfolio.**
 
 Think of it as:  
-> *“On each start date, which funds should I buy?”*
+> *“On each start date, which funds should I buy, and based on what score?”*
 """
         )
 
+        # --- handle any "insert column into formula" clicks -------------
+        # (buttons set a pending value, we apply it before rendering widgets)
+        if "entry_signal_expr_append" in st.session_state:
+            to_add = st.session_state.pop("entry_signal_expr_append")
+            cur = st.session_state.get("entry_signal_expression", "")
+            # Add a space if needed (avoid squashing tokens)
+            sep = "" if not cur or cur.endswith((" ", "(", "+", "-", "*", "/", ",")) else " "
+            st.session_state["entry_signal_expression"] = cur + sep + to_add
+
+        if "entry_signal_filter_append" in st.session_state:
+            to_add = st.session_state.pop("entry_signal_filter_append")
+            cur = st.session_state.get("entry_signal_filter_expression", "")
+            sep = "" if not cur or cur.endswith((" ", "(", "+", "-", "*", "/", ",")) else " "
+            st.session_state["entry_signal_filter_expression"] = cur + sep + to_add
+
+        # ----------------- SIGNAL DEFINITION -------------------------
         st.subheader("Signal (scoring rule) for initial selection")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.text_input(
-                "Signal name",
-                key="entry_signal_name",
-                help="Example: rank_12m_category, rank_3y_universe, perf_1y, etc. The engine maps this to a column in performance_ranking.",
-            )
-        with col2:
-            st.radio(
-                "How should scores be interpreted?",
-                options=["asc", "desc"],
-                format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc" else "Higher is better (returns / scores)",
-                key="entry_signal_direction",
+        signal_mode = st.radio(
+            "How do you want to define the signal?",
+            options=["simple", "formula"],
+            format_func=lambda x: "Simple named signal" if x == "simple" else "Custom formula over DB fields",
+            key="entry_signal_mode",
+        )
+
+        if signal_mode == "simple":
+            # Existing behaviour: just a name that maps to a single column
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input(
+                    "Signal name",
+                    key="entry_signal_name",
+                    help=(
+                        "Example: rank_12m_category, rank_3y_universe, perf_1y, etc. "
+                        "The engine maps this to a single column in performance_ranking."
+                    ),
+                )
+            with col2:
+                st.radio(
+                    "How should scores be interpreted?",
+                    options=["asc", "desc"],
+                    format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc"
+                    else "Higher is better (returns / scores)",
+                    key="entry_signal_direction",
+                )
+
+            st.caption(
+                "In this mode the signal name is mapped to one column, e.g. "
+                "`rank_12m_category` → `rank_1y_category` in performance_ranking."
             )
 
+        else:
+            # Formula mode: score = expression(performance_ranking fields)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input(
+                    "Logical name for this signal",
+                    key="entry_signal_name",
+                    help=(
+                        "A short label like 'mom_blend_1_3_5y'. "
+                        "This is stored in the config and used in filenames."
+                    ),
+                )
+            with col2:
+                st.radio(
+                    "How should scores be interpreted?",
+                    options=["asc", "desc"],
+                    format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc"
+                    else "Higher is better (returns / scores)",
+                    key="entry_signal_direction",
+                )
+
+            st.markdown("### Score formula")
+
+            st.text_area(
+                "Score formula (score = ...)",
+                key="entry_signal_expression",
+                height=100,
+                help=(
+                    "Use columns from performance_ranking like perf_1m, perf_3m, perf_6m, perf_1y, "
+                    "rank_1y_category, aum_cr, age_years, etc.\n\n"
+                    "Examples:\n"
+                    "  0.4 * perf_1y + 0.4 * perf_3y + 0.2 * perf_5y\n"
+                    "  zscore(perf_1y) + zscore(perf_3y)\n\n"
+                    "Allowed functions: abs, log, exp, sqrt, zscore, min, max, pow.\n"
+                    "You can use ^ as power: perf_6m ^ 2 == perf_6m ** 2."
+                ),
+            )
+
+            st.markdown("### Optional filter (pre-selection)")
+
+            st.text_area(
+                "Filter expression (boolean)",
+                key="entry_signal_filter_expression",
+                height=80,
+                help=(
+                    "Filter out funds before scoring. Example:\n"
+                    "  aum_cr >= 300 and age_years >= 3\n"
+                    "Only rows where this is True remain eligible."
+                ),
+            )
+
+            # --- Redash-style column search + insert ------------------
+                        # --- Table + column search & insert ----------------------
+            registry, reg_err = load_signal_field_registry()
+            with st.expander("🔎 Available tables & columns to use in formulas", expanded=False):
+                if reg_err:
+                    st.warning(
+                        "Could not introspect selection fields from DB.\n\n"
+                        f"Raw error: `{reg_err}`"
+                    )
+                elif not registry:
+                    st.info("No fields loaded (is the DB reachable?).")
+                else:
+                    # Available tables from the registry (e.g. performance_ranking, scheme_details)
+                    all_tables = sorted({fi.table for fi in registry.values()})
+
+                    tables_key = "entry_signal_tables"
+
+                    # On first render (or if somehow empty), default to "all tables"
+                    if tables_key not in st.session_state or not st.session_state[tables_key]:
+                        st.session_state[tables_key] = all_tables
+
+                    selected_tables = st.multiselect(
+                        "Tables to show columns from",
+                        options=all_tables,
+                        key=tables_key,
+                        help="Pick one or more logical tables. The columns list below is restricted to these.",
+                    )
+                    
+                    search = st.text_input(
+                        "Search columns (type to filter, then click to insert)",
+                        key="entry_signal_field_search",
+                        placeholder="e.g. perf_1y, rank_1y_category, aum_cr ...",
+                    )
+
+                    # Filter registry by selected tables + search
+                    filtered_items = [
+                        (name, fi)
+                        for name, fi in registry.items()
+                        if (not selected_tables or fi.table in selected_tables)
+                    ]
+                    if search:
+                        s_lower = search.lower()
+                        filtered_items = [
+                            (name, fi)
+                            for name, fi in filtered_items
+                            if s_lower in name.lower()
+                        ]
+
+                    if not filtered_items:
+                        st.write("No columns match this selection.")
+                    else:
+                        st.caption(
+                            "Click a button to insert the column name into the score or filter formula."
+                        )
+                        # Group by table for display
+                        by_table: dict[str, list[str]] = {}
+                        for name, fi in filtered_items:
+                            by_table.setdefault(fi.table, []).append(name)
+
+                        for tbl in sorted(by_table.keys()):
+                            st.markdown(f"**{tbl}**")
+                            for field in sorted(by_table[tbl]):
+                                c1, c2, c3 = st.columns([3, 1, 1])
+                                with c1:
+                                    st.code(field, language="text")
+                                with c2:
+                                    if st.button("↳ score", key=f"expr_{tbl}_{field}"):
+                                        st.session_state["entry_signal_expr_append"] = field
+                                with c3:
+                                    if st.button("↳ filter", key=f"filt_{tbl}_{field}"):
+                                        st.session_state["entry_signal_filter_append"] = field
+                                        
+        # ----------------- SELECTION RULE ----------------------------
         st.subheader("Selection rule at portfolio inception")
 
         st.radio(
@@ -906,7 +1118,7 @@ Think of it as:
             st.button("⬅ Previous", on_click=lambda: go_to_step(2))
         with col_next:
             st.button("Next ➡", on_click=lambda: go_to_step(4))
-
+            
     # --------------------------------------------------------------
     # STEP 4 – Rebalancing & (optional) separate criteria
     # --------------------------------------------------------------

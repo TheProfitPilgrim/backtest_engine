@@ -183,9 +183,7 @@ class PostgresDataProvider(DataProvider):
 
         if df.empty:
             raise RuntimeError(
-                f"No performance_ranking data found for as_of={as_of}. "
-                "Try using a later study_window.start, or check the available "
-                "date range in performance_ranking for plan_code=5."
+                f"No performance_ranking rows found for as_of={as_of}."
             )
 
         # 2) Optionally restrict to schemecodes passed in
@@ -201,6 +199,9 @@ class PostgresDataProvider(DataProvider):
         # Drop the window helper column if present
         if "rn" in df.columns:
             df = df.drop(columns=["rn"])
+
+        # 2.5) Attach static dimension tables (e.g. scheme_details)
+        df = self._attach_selection_dimension_tables(df)
 
         # 2.5) Load allowed field metadata from performance_ranking
         #      (this enforces that formulas only use valid columns)
@@ -265,7 +266,52 @@ class PostgresDataProvider(DataProvider):
 
         # Final output: schemecode + score
         return df[["schemecode", "score"]]
+    
+        def _attach_selection_dimension_tables(self, df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Attach additional static columns (from tables like scheme_details)
+            to the per-date selection snapshot used for formulas.
 
+            This lets formulas reference, e.g., scheme_details columns directly,
+            while preserving the no-lookahead property (scheme_details is static).
+            """
+        if df.empty:
+            return df
+
+        if "schemecode" not in df.columns:
+            return df
+
+        # Unique schemecodes in this snapshot
+        codes = sorted({int(x) for x in df["schemecode"].unique() if pd.notna(x)})
+        if not codes:
+            return df
+
+        # Fetch scheme_details for these codes
+        codes_sql = ",".join(str(c) for c in codes)
+        sd_query = f"""
+        SELECT *
+        FROM scheme_details
+        WHERE schemecode IN ({codes_sql})
+        """
+        try:
+            sd = run_sql(sd_query)
+        except Exception:
+            # If this fails, fall back to base snapshot
+            return df
+
+        if sd.empty or "schemecode" not in sd.columns:
+            return df
+
+        # Deduplicate and keep only genuinely new columns
+        sd = sd.drop_duplicates(subset=["schemecode"])
+        extra_cols = [c for c in sd.columns if c != "schemecode" and c not in df.columns]
+        if not extra_cols:
+            return df
+
+        sd_small = sd[["schemecode"] + extra_cols]
+        merged = df.merge(sd_small, on="schemecode", how="left")
+
+        return merged
     # ---------- NAV series ----------------------------------------------
 
     def get_nav_series(

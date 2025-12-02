@@ -1,8 +1,0 @@
-fees:
-  apply: true
-  annual_bps: 100.0
-tax:
-  apply: false
-  stcg_rate: 15.0
-  ltcg_rate: 10.0
-  ltcg_holding_days: 365

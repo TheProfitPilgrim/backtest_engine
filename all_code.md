@@ -159,19 +159,15 @@ from backtest_engine.config import (
 )
 from backtest_engine.engine import BacktestEngine
 from backtest_engine.postgres_provider import PostgresDataProvider
-from backtest_engine.db import run_sql
+
+from backtest_engine.db import run_sql, get_engine
+from backtest_engine.formula import load_selection_field_registry
 
 from backtest_engine.app_settings import (
-    AppSettings,
-    FeeSettings,
-    TaxSettings,
-    load_app_settings,
     load_universe_presets,
-    save_app_settings,
     save_universe_presets,
 )
 
-# -------------------------------------------------------------------
 # Paths & constants
 # -------------------------------------------------------------------
 
@@ -296,7 +292,6 @@ def describe_backtest(
 # -------------------------------------------------------------------
 # Session state init
 # -------------------------------------------------------------------
-
 def init_session_state():
     if "wizard_step" not in st.session_state:
         st.session_state.wizard_step = 1
@@ -304,10 +299,7 @@ def init_session_state():
     # Navigation: default to wizard
     st.session_state.setdefault("nav_page", "Backtest wizard")
 
-    # Load persisted app-level defaults (fees & tax)
-    app_settings = load_app_settings()
-
-    # Basic fields defaults
+    # --- Basic backtest defaults ---------------------------------------
     st.session_state.setdefault("run_name", "mf-10y-annual-top15")
     st.session_state.setdefault("mode", "single")
     st.session_state.setdefault("study_start", date(2014, 1, 1))
@@ -322,6 +314,11 @@ def init_session_state():
     st.session_state.setdefault("entry_selection_mode", "top_n")
     st.session_state.setdefault("entry_top_n", 15)
     st.session_state.setdefault("entry_min_funds", 10)
+    # Signal definition mode + formula bits
+    st.session_state.setdefault("entry_signal_mode", "simple")  # "simple" or "formula"
+    st.session_state.setdefault("entry_signal_expression", "")
+    st.session_state.setdefault("entry_signal_filter_expression", "")
+    st.session_state.setdefault("entry_signal_field_search", "")
 
     # Rebalance
     st.session_state.setdefault("rebalance_frequency", "12M")
@@ -336,15 +333,20 @@ def init_session_state():
     st.session_state.setdefault("cohort_start_frequency", "1M")
     st.session_state.setdefault("cohort_horizon_years", 3.0)
 
-    # Fees & tax – seed from app-level defaults defined in app_settings.yaml
-    st.session_state.setdefault("fees_apply", app_settings.fees.apply)
-    st.session_state.setdefault("fees_annual_bps", app_settings.fees.annual_bps)
+    # --- Fees & taxes: HARD-CODED wizard defaults ----------------------
+    # Your requested defaults:
+    #   fee      = 100 bps (1.00% p.a.)
+    #   STCG     = 20%
+    #   LTCG     = 12.5%
+    #   LTCG min = 365 days
 
-    st.session_state.setdefault("tax_apply", app_settings.tax.apply)
-    st.session_state.setdefault("tax_stcg_rate", app_settings.tax.stcg_rate)
-    st.session_state.setdefault("tax_ltcg_rate", app_settings.tax.ltcg_rate)
-    st.session_state.setdefault("tax_ltcg_days", app_settings.tax.ltcg_holding_days)
+    st.session_state.setdefault("fees_apply", True)
+    st.session_state.setdefault("fees_annual_bps", 100.0)
 
+    st.session_state.setdefault("tax_apply", True)
+    st.session_state.setdefault("tax_stcg_rate", 20.0)
+    st.session_state.setdefault("tax_ltcg_rate", 12.5)
+    st.session_state.setdefault("tax_ltcg_days", 365)
 
 def go_to_step(step: int):
     st.session_state.wizard_step = step
@@ -353,6 +355,22 @@ def go_to_step(step: int):
 # -------------------------------------------------------------------
 # Universe Presets Page (full-page manager)
 # -------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_signal_field_registry():
+    """
+    Cached wrapper over load_selection_field_registry for the Step 3 UI.
+
+    Returns (registry, error_msg). 'registry' maps column_name -> FieldInfo,
+    and FieldInfo.table tells you which table it came from.
+    """
+    try:
+        engine = get_engine()
+        registry = load_selection_field_registry(engine)
+    except Exception as e:
+        return {}, str(e)
+
+    return registry, None
 
 @st.cache_data(show_spinner=False)
 def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]], str | None]:
@@ -392,6 +410,20 @@ def load_category_taxonomy() -> Tuple[List[str], List[str], Dict[str, List[str]]
         cats_by_asset[atype] = sorted(cats)
 
     return asset_types, categories, cats_by_asset, None
+
+@st.cache_data(show_spinner=False)
+def load_signal_fields() -> tuple[list[str], str | None]:
+    """
+    Load the list of allowed fields from performance_ranking
+    that can be used in Step 3 formulas.
+    """
+    try:
+        engine = get_engine()
+        registry = load_selection_field_registry(engine)
+    except Exception as e:
+        return [], str(e)
+
+    return sorted(registry.keys()), None
 
 def universe_presets_page() -> None:
     st.title("📚 Universe presets")
@@ -734,89 +766,6 @@ the *starting defaults* for new sessions.
 """
     )
 
-    app_settings = load_app_settings()
-
-    st.subheader("Fees (default)")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fees_apply = st.checkbox(
-            "Apply fees by default?",
-            value=app_settings.fees.apply,
-            key="settings_fees_apply",
-        )
-    with col2:
-        fees_bps = st.number_input(
-            "Annual fee (bps)",
-            min_value=0.0,
-            max_value=1000.0,
-            step=5.0,
-            value=float(app_settings.fees.annual_bps),
-            key="settings_fees_annual_bps",
-            help="100 bps = 1.00% p.a.",
-        )
-
-    st.subheader("Tax (default)")
-
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        tax_apply = st.checkbox(
-            "Capture capital gains tax by default?",
-            value=app_settings.tax.apply,
-            key="settings_tax_apply",
-            help="Tax is currently not applied in the engine yet; only stored in config.",
-        )
-    with col4:
-        stcg_rate = st.number_input(
-            "STCG rate (%)",
-            min_value=0.0,
-            max_value=50.0,
-            step=0.5,
-            value=float(app_settings.tax.stcg_rate),
-            key="settings_tax_stcg_rate",
-        )
-    with col5:
-        ltcg_rate = st.number_input(
-            "LTCG rate (%)",
-            min_value=0.0,
-            max_value=50.0,
-            step=0.5,
-            value=float(app_settings.tax.ltcg_rate),
-            key="settings_tax_ltcg_rate",
-        )
-
-    ltcg_days = st.number_input(
-        "LTCG minimum holding period (days)",
-        min_value=0,
-        max_value=3650,
-        step=1,
-        value=int(app_settings.tax.ltcg_holding_days),
-        key="settings_tax_ltcg_days",
-    )
-
-    if st.button("💾 Save defaults", key="settings_save_button"):
-        new_settings = AppSettings(
-            fees=FeeSettings(apply=fees_apply, annual_bps=fees_bps),
-            tax=TaxSettings(
-                apply=tax_apply,
-                stcg_rate=stcg_rate,
-                ltcg_rate=ltcg_rate,
-                ltcg_holding_days=ltcg_days,
-            ),
-        )
-        save_app_settings(new_settings)
-
-        # Also push into the current wizard session so it's consistent
-        st.session_state.fees_apply = fees_apply
-        st.session_state.fees_annual_bps = fees_bps
-        st.session_state.tax_apply = tax_apply
-        st.session_state.tax_stcg_rate = stcg_rate
-        st.session_state.tax_ltcg_rate = ltcg_rate
-        st.session_state.tax_ltcg_days = ltcg_days
-
-        st.success("Defaults saved. New backtests will use these values.")
-
-
 # -------------------------------------------------------------------
 # Build BacktestConfig from session_state
 # -------------------------------------------------------------------
@@ -830,9 +779,26 @@ def build_config_from_state() -> BacktestConfig:
     study_window = StudyWindow(start=start_date, end=end_date)
     universe = UniverseConfig(preset=st.session_state.universe_preset)
 
+    # Entry signal: simple vs formula mode
+    entry_signal_mode = st.session_state.get("entry_signal_mode", "simple")
+    expr = st.session_state.get("entry_signal_expression", "").strip()
+    filt_expr = st.session_state.get("entry_signal_filter_expression", "").strip()
+
+    # Only keep expressions if we're in formula mode and something is actually entered
+    if entry_signal_mode != "formula":
+        expr = None
+        filt_expr = None
+    else:
+        if not expr:
+            expr = None
+        if not filt_expr:
+            filt_expr = None
+
     entry_signal = SignalConfig(
         name=st.session_state.entry_signal_name,
         direction=st.session_state.entry_signal_direction,
+        expression=expr,
+        filter_expression=filt_expr,
     )
 
     entry_selection = SelectionConfig(
@@ -918,16 +884,13 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        options=["Backtest wizard", "Universe presets", "App settings"],
+        options=["Backtest wizard", "Universe presets"],
         key="nav_page",
     )
 
     # Route to dedicated pages first
     if page == "Universe presets":
         universe_presets_page()
-        return
-    elif page == "App settings":
-        app_settings_page()
         return
 
     # From here on, we're in the Backtest wizard
@@ -1069,27 +1032,185 @@ You can define and edit presets on the **Universe presets** page in the sidebar.
 Here you tell the engine **how to score and pick funds at the start of the portfolio.**
 
 Think of it as:  
-> *“On each start date, which funds should I buy?”*
+> *“On each start date, which funds should I buy, and based on what score?”*
 """
         )
 
+        # --- handle any "insert column into formula" clicks -------------
+        # (buttons set a pending value, we apply it before rendering widgets)
+        if "entry_signal_expr_append" in st.session_state:
+            to_add = st.session_state.pop("entry_signal_expr_append")
+            cur = st.session_state.get("entry_signal_expression", "")
+            # Add a space if needed (avoid squashing tokens)
+            sep = "" if not cur or cur.endswith((" ", "(", "+", "-", "*", "/", ",")) else " "
+            st.session_state["entry_signal_expression"] = cur + sep + to_add
+
+        if "entry_signal_filter_append" in st.session_state:
+            to_add = st.session_state.pop("entry_signal_filter_append")
+            cur = st.session_state.get("entry_signal_filter_expression", "")
+            sep = "" if not cur or cur.endswith((" ", "(", "+", "-", "*", "/", ",")) else " "
+            st.session_state["entry_signal_filter_expression"] = cur + sep + to_add
+
+        # ----------------- SIGNAL DEFINITION -------------------------
         st.subheader("Signal (scoring rule) for initial selection")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.text_input(
-                "Signal name",
-                key="entry_signal_name",
-                help="Example: rank_12m_category, rank_3y_universe, perf_1y, etc. The engine maps this to a column in performance_ranking.",
-            )
-        with col2:
-            st.radio(
-                "How should scores be interpreted?",
-                options=["asc", "desc"],
-                format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc" else "Higher is better (returns / scores)",
-                key="entry_signal_direction",
+        signal_mode = st.radio(
+            "How do you want to define the signal?",
+            options=["simple", "formula"],
+            format_func=lambda x: "Simple named signal" if x == "simple" else "Custom formula over DB fields",
+            key="entry_signal_mode",
+        )
+
+        if signal_mode == "simple":
+            # Existing behaviour: just a name that maps to a single column
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input(
+                    "Signal name",
+                    key="entry_signal_name",
+                    help=(
+                        "Example: rank_12m_category, rank_3y_universe, perf_1y, etc. "
+                        "The engine maps this to a single column in performance_ranking."
+                    ),
+                )
+            with col2:
+                st.radio(
+                    "How should scores be interpreted?",
+                    options=["asc", "desc"],
+                    format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc"
+                    else "Higher is better (returns / scores)",
+                    key="entry_signal_direction",
+                )
+
+            st.caption(
+                "In this mode the signal name is mapped to one column, e.g. "
+                "`rank_12m_category` → `rank_1y_category` in performance_ranking."
             )
 
+        else:
+            # Formula mode: score = expression(performance_ranking fields)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_input(
+                    "Logical name for this signal",
+                    key="entry_signal_name",
+                    help=(
+                        "A short label like 'mom_blend_1_3_5y'. "
+                        "This is stored in the config and used in filenames."
+                    ),
+                )
+            with col2:
+                st.radio(
+                    "How should scores be interpreted?",
+                    options=["asc", "desc"],
+                    format_func=lambda x: "Lower is better (ranks: 1 is best)" if x == "asc"
+                    else "Higher is better (returns / scores)",
+                    key="entry_signal_direction",
+                )
+
+            st.markdown("### Score formula")
+
+            st.text_area(
+                "Score formula (score = ...)",
+                key="entry_signal_expression",
+                height=100,
+                help=(
+                    "Use columns from performance_ranking like perf_1m, perf_3m, perf_6m, perf_1y, "
+                    "rank_1y_category, aum_cr, age_years, etc.\n\n"
+                    "Examples:\n"
+                    "  0.4 * perf_1y + 0.4 * perf_3y + 0.2 * perf_5y\n"
+                    "  zscore(perf_1y) + zscore(perf_3y)\n\n"
+                    "Allowed functions: abs, log, exp, sqrt, zscore, min, max, pow.\n"
+                    "You can use ^ as power: perf_6m ^ 2 == perf_6m ** 2."
+                ),
+            )
+
+            st.markdown("### Optional filter (pre-selection)")
+
+            st.text_area(
+                "Filter expression (boolean)",
+                key="entry_signal_filter_expression",
+                height=80,
+                help=(
+                    "Filter out funds before scoring. Example:\n"
+                    "  aum_cr >= 300 and age_years >= 3\n"
+                    "Only rows where this is True remain eligible."
+                ),
+            )
+
+            # --- Redash-style column search + insert ------------------
+                        # --- Table + column search & insert ----------------------
+            registry, reg_err = load_signal_field_registry()
+            with st.expander("🔎 Available tables & columns to use in formulas", expanded=False):
+                if reg_err:
+                    st.warning(
+                        "Could not introspect selection fields from DB.\n\n"
+                        f"Raw error: `{reg_err}`"
+                    )
+                elif not registry:
+                    st.info("No fields loaded (is the DB reachable?).")
+                else:
+                    # Available tables from the registry (e.g. performance_ranking, scheme_details)
+                    all_tables = sorted({fi.table for fi in registry.values()})
+
+                    tables_key = "entry_signal_tables"
+
+                    # On first render (or if somehow empty), default to "all tables"
+                    if tables_key not in st.session_state or not st.session_state[tables_key]:
+                        st.session_state[tables_key] = all_tables
+
+                    selected_tables = st.multiselect(
+                        "Tables to show columns from",
+                        options=all_tables,
+                        key=tables_key,
+                        help="Pick one or more logical tables. The columns list below is restricted to these.",
+                    )
+                    
+                    search = st.text_input(
+                        "Search columns (type to filter, then click to insert)",
+                        key="entry_signal_field_search",
+                        placeholder="e.g. perf_1y, rank_1y_category, aum_cr ...",
+                    )
+
+                    # Filter registry by selected tables + search
+                    filtered_items = [
+                        (name, fi)
+                        for name, fi in registry.items()
+                        if (not selected_tables or fi.table in selected_tables)
+                    ]
+                    if search:
+                        s_lower = search.lower()
+                        filtered_items = [
+                            (name, fi)
+                            for name, fi in filtered_items
+                            if s_lower in name.lower()
+                        ]
+
+                    if not filtered_items:
+                        st.write("No columns match this selection.")
+                    else:
+                        st.caption(
+                            "Click a button to insert the column name into the score or filter formula."
+                        )
+                        # Group by table for display
+                        by_table: dict[str, list[str]] = {}
+                        for name, fi in filtered_items:
+                            by_table.setdefault(fi.table, []).append(name)
+
+                        for tbl in sorted(by_table.keys()):
+                            st.markdown(f"**{tbl}**")
+                            for field in sorted(by_table[tbl]):
+                                c1, c2, c3 = st.columns([3, 1, 1])
+                                with c1:
+                                    st.code(field, language="text")
+                                with c2:
+                                    if st.button("↳ score", key=f"expr_{tbl}_{field}"):
+                                        st.session_state["entry_signal_expr_append"] = field
+                                with c3:
+                                    if st.button("↳ filter", key=f"filt_{tbl}_{field}"):
+                                        st.session_state["entry_signal_filter_append"] = field
+                                        
+        # ----------------- SELECTION RULE ----------------------------
         st.subheader("Selection rule at portfolio inception")
 
         st.radio(
@@ -1136,7 +1257,7 @@ Think of it as:
             st.button("⬅ Previous", on_click=lambda: go_to_step(2))
         with col_next:
             st.button("Next ➡", on_click=lambda: go_to_step(4))
-
+            
     # --------------------------------------------------------------
     # STEP 4 – Rebalancing & (optional) separate criteria
     # --------------------------------------------------------------
@@ -2443,6 +2564,12 @@ def load_table_columns(
         )
     return fields
 
+# Which tables feed the SELECTION "mart"
+SELECTION_MART_TABLES = [
+    "performance_ranking",  # time-series ranking/perf snapshot
+    "scheme_details",       # static scheme metadata
+]
+
 
 def load_selection_field_registry(
     engine: Engine,
@@ -2451,12 +2578,35 @@ def load_selection_field_registry(
     """
     Load the registry of *allowed* fields for SELECTION formulas.
 
-    For now, we restrict this to the `performance_ranking` table only.
-    Later you can extend this to a view or additional tables.
-    """
-    TABLE = "performance_ranking"
-    return load_table_columns(engine, TABLE, schema=schema)
+    We build a logical "selection mart" by unioning columns from a small,
+    curated set of tables (SELECTION_MART_TABLES). For now:
+        - performance_ranking
+        - scheme_details
 
+    Later you can add more tables here once get_signal_scores joins them.
+    """
+    fields: Dict[str, FieldInfo] = {}
+
+    for table in SELECTION_MART_TABLES:
+        try:
+            table_fields = load_table_columns(engine, table_name=table, schema=schema)
+        except Exception:
+            # If a table is missing or fails introspection, just skip it.
+            continue
+
+        for col_name, info in table_fields.items():
+            # If multiple tables share a column name, keep the first one we saw.
+            # In practice, perf_ranking will be first so its columns win.
+            if col_name in fields:
+                continue
+            fields[col_name] = info
+
+    if not fields:
+        raise RuntimeError(
+            f"No selection fields found in tables: {', '.join(SELECTION_MART_TABLES)}"
+        )
+
+    return fields
 
 # ---------- Safe-ish expression evaluator over a DataFrame ----------
 
@@ -3109,9 +3259,7 @@ class PostgresDataProvider(DataProvider):
 
         if df.empty:
             raise RuntimeError(
-                f"No performance_ranking data found for as_of={as_of}. "
-                "Try using a later study_window.start, or check the available "
-                "date range in performance_ranking for plan_code=5."
+                f"No performance_ranking rows found for as_of={as_of}."
             )
 
         # 2) Optionally restrict to schemecodes passed in
@@ -3127,6 +3275,9 @@ class PostgresDataProvider(DataProvider):
         # Drop the window helper column if present
         if "rn" in df.columns:
             df = df.drop(columns=["rn"])
+
+        # 2.5) Attach static dimension tables (e.g. scheme_details)
+        df = self._attach_selection_dimension_tables(df)
 
         # 2.5) Load allowed field metadata from performance_ranking
         #      (this enforces that formulas only use valid columns)
@@ -3191,7 +3342,52 @@ class PostgresDataProvider(DataProvider):
 
         # Final output: schemecode + score
         return df[["schemecode", "score"]]
+    
+        def _attach_selection_dimension_tables(self, df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Attach additional static columns (from tables like scheme_details)
+            to the per-date selection snapshot used for formulas.
 
+            This lets formulas reference, e.g., scheme_details columns directly,
+            while preserving the no-lookahead property (scheme_details is static).
+            """
+        if df.empty:
+            return df
+
+        if "schemecode" not in df.columns:
+            return df
+
+        # Unique schemecodes in this snapshot
+        codes = sorted({int(x) for x in df["schemecode"].unique() if pd.notna(x)})
+        if not codes:
+            return df
+
+        # Fetch scheme_details for these codes
+        codes_sql = ",".join(str(c) for c in codes)
+        sd_query = f"""
+        SELECT *
+        FROM scheme_details
+        WHERE schemecode IN ({codes_sql})
+        """
+        try:
+            sd = run_sql(sd_query)
+        except Exception:
+            # If this fails, fall back to base snapshot
+            return df
+
+        if sd.empty or "schemecode" not in sd.columns:
+            return df
+
+        # Deduplicate and keep only genuinely new columns
+        sd = sd.drop_duplicates(subset=["schemecode"])
+        extra_cols = [c for c in sd.columns if c != "schemecode" and c not in df.columns]
+        if not extra_cols:
+            return df
+
+        sd_small = sd[["schemecode"] + extra_cols]
+        merged = df.merge(sd_small, on="schemecode", how="left")
+
+        return merged
     # ---------- NAV series ----------------------------------------------
 
     def get_nav_series(

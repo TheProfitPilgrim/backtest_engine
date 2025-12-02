@@ -45,6 +45,12 @@ def load_table_columns(
         )
     return fields
 
+# Which tables feed the SELECTION "mart"
+SELECTION_MART_TABLES = [
+    "performance_ranking",  # time-series ranking/perf snapshot
+    "scheme_details",       # static scheme metadata
+]
+
 
 def load_selection_field_registry(
     engine: Engine,
@@ -53,12 +59,35 @@ def load_selection_field_registry(
     """
     Load the registry of *allowed* fields for SELECTION formulas.
 
-    For now, we restrict this to the `performance_ranking` table only.
-    Later you can extend this to a view or additional tables.
-    """
-    TABLE = "performance_ranking"
-    return load_table_columns(engine, TABLE, schema=schema)
+    We build a logical "selection mart" by unioning columns from a small,
+    curated set of tables (SELECTION_MART_TABLES). For now:
+        - performance_ranking
+        - scheme_details
 
+    Later you can add more tables here once get_signal_scores joins them.
+    """
+    fields: Dict[str, FieldInfo] = {}
+
+    for table in SELECTION_MART_TABLES:
+        try:
+            table_fields = load_table_columns(engine, table_name=table, schema=schema)
+        except Exception:
+            # If a table is missing or fails introspection, just skip it.
+            continue
+
+        for col_name, info in table_fields.items():
+            # If multiple tables share a column name, keep the first one we saw.
+            # In practice, perf_ranking will be first so its columns win.
+            if col_name in fields:
+                continue
+            fields[col_name] = info
+
+    if not fields:
+        raise RuntimeError(
+            f"No selection fields found in tables: {', '.join(SELECTION_MART_TABLES)}"
+        )
+
+    return fields
 
 # ---------- Safe-ish expression evaluator over a DataFrame ----------
 
